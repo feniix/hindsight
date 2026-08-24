@@ -137,7 +137,8 @@ npx @vectorize-io/hindsight-coding-agents install prime-agent
 ```
 
 Prime Agent is a fork of pi, so it is wired the same way: an extension entry, here in
-`~/.prime/agent/settings.json` — native tools, no MCP needed. Installing both is fine and expected:
+`~/.prime/agent/settings.json`, plus the companion skill in `~/.prime/agent/skills` — native tools,
+no MCP needed. Installing both is fine and expected:
 each host loads its own entry from its own settings file, and like every other pair of agents they
 **share one bank per repo** (the default `coding-agent::{gitProject}`), so what you tell pi is there
 when you open Prime Agent. Separate entries are what keeps each side attributable — its own

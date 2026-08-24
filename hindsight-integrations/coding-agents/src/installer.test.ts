@@ -560,11 +560,14 @@ describe.each([
   });
 });
 
-describe("pi companion skill", () => {
-  // pi discovers `~/.pi/agent/skills` and the shared `~/.agents/skills`. We write pi's OWN
+describe("pi-family companion skill", () => {
+  // Both hosts discover their own skills root AND the shared `~/.agents/skills`. We write the OWN
   // directory: the shared root is where Codex and dsh install, and uninstallSkill removes by a
   // fixed name, so installing there would make `uninstall pi` delete their copy too.
-  const skillDir = (ctx: InstallCtx) => join(ctx.home, ".pi", "agent", "skills");
+  const HOSTS: [string, string[]][] = [
+    ["pi", [".pi", "agent", "skills"]],
+    ["prime-agent", [".prime", "agent", "skills"]],
+  ];
 
   /** makeCtx's pkgRoot is a synthetic /opt path that does not exist, so the packaged skill can't be
    *  staged in it. Build a real temp package root instead, like the cross-host skill test below. */
@@ -581,31 +584,43 @@ describe("pi companion skill", () => {
     return { home, pkgRoot, dist: join(pkgRoot, "dist"), claudeMcp: vi.fn(() => true) };
   }
 
-  it("installs the packaged skill into pi's own skills directory and removes it on uninstall", () => {
+  it.each(HOSTS)(
+    "%s installs the packaged skill into its own skills directory and removes it on uninstall",
+    (harness, dir) => {
+      const ctx = ctxWithSkill();
+      const base = join(ctx.home, ...dir);
+      run(["install", harness], ctx);
+      expect(existsSync(join(base, "hindsight-coding-agent", "SKILL.md"))).toBe(true);
+      run(["uninstall", harness], ctx);
+      expect(existsSync(join(base, "hindsight-coding-agent"))).toBe(false);
+    }
+  );
+
+  it.each(HOSTS)(
+    "uninstalling %s cannot strip Codex's copy from the shared ~/.agents/skills root",
+    (harness) => {
+      const ctx = ctxWithSkill();
+      run(["install", "codex"], ctx);
+      const shared = join(ctx.home, ".agents", "skills", "hindsight-coding-agent");
+      expect(existsSync(shared)).toBe(true);
+
+      run(["install", harness], ctx);
+      run(["uninstall", harness], ctx);
+      expect(existsSync(shared)).toBe(true);
+    }
+  );
+
+  // The two hosts write DIFFERENT roots, so one's uninstall must not touch the other's skill —
+  // the same independence the settings files already have.
+  it("installing both gives each its own copy, and uninstalling one leaves the other", () => {
     const ctx = ctxWithSkill();
     run(["install", "pi"], ctx);
-    expect(existsSync(join(skillDir(ctx), "hindsight-coding-agent", "SKILL.md"))).toBe(true);
-    run(["uninstall", "pi"], ctx);
-    expect(existsSync(join(skillDir(ctx), "hindsight-coding-agent"))).toBe(false);
-  });
-
-  it("leaves the shared ~/.agents/skills root alone, so uninstalling pi cannot strip Codex's copy", () => {
-    const ctx = ctxWithSkill();
-    run(["install", "codex"], ctx);
-    const shared = join(ctx.home, ".agents", "skills", "hindsight-coding-agent");
-    expect(existsSync(shared)).toBe(true);
-
-    run(["install", "pi"], ctx);
-    run(["uninstall", "pi"], ctx);
-    expect(existsSync(shared)).toBe(true);
-  });
-
-  // Prime Agent reads `~/.prime/agent/skills` and could take the skill too; it deliberately does
-  // not yet, so pin that rather than leave the difference looking accidental.
-  it("does not install a skill for prime-agent", () => {
-    const ctx = ctxWithSkill();
     run(["install", "prime-agent"], ctx);
-    expect(existsSync(join(ctx.home, ".prime", "agent", "skills"))).toBe(false);
+    const primeSkill = join(ctx.home, ".prime", "agent", "skills", "hindsight-coding-agent");
+    expect(existsSync(primeSkill)).toBe(true);
+
+    run(["uninstall", "pi"], ctx);
+    expect(existsSync(primeSkill)).toBe(true);
   });
 });
 

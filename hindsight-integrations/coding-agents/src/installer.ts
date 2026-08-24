@@ -281,16 +281,17 @@ const opencode: HarnessInstaller = {
  * host gets the entry that reports its own harness.
  *
  * `skillsDir` is per-host rather than shared: both read `~/.agents/skills` too, but that is the
- * root Codex and dsh install into, so putting ours there would make uninstalling one host delete
- * the other hosts' copy. Each writes its OWN skills directory instead.
+ * root Codex and dsh install into, and uninstallSkill removes by a fixed directory name — so
+ * putting ours there would make uninstalling one host delete the other hosts' copy. Each writes
+ * its OWN skills directory instead.
  */
 function piFamilyInstaller(
   harness: string,
   configDir: string[],
-  skillsDir?: string[]
+  skillsDir: string[]
 ): HarnessInstaller {
   const settings = (c: InstallCtx) => join(c.home, ...configDir, "settings.json");
-  const skills = (c: InstallCtx) => (skillsDir ? join(c.home, ...skillsDir) : undefined);
+  const skills = (c: InstallCtx) => join(c.home, ...skillsDir);
   return {
     name: harness,
     // Both hosts name their executable exactly as we name the harness, so the harness id doubles
@@ -303,13 +304,11 @@ function piFamilyInstaller(
       const exts: string[] = Array.isArray(cfg.extensions) ? cfg.extensions : [];
       cfg.extensions = [...exts.filter((p) => !String(p).includes(MARKER)), entry];
       writeJson(path, cfg);
-      const skillsBase = skills(c);
-      if (skillsBase) installSkill(c, harness, skillsBase);
+      installSkill(c, harness, skills(c));
       c.log?.(`${harness}: extension registered in ${path}`);
     },
     uninstall(c) {
-      const skillsBase = skills(c);
-      if (skillsBase) uninstallSkill(c, skillsBase);
+      uninstallSkill(c, skills(c));
       const path = settings(c);
       if (!existsSync(path)) return;
       const cfg = readJson(path);
@@ -318,15 +317,17 @@ function piFamilyInstaller(
         if (!cfg.extensions.length) delete cfg.extensions;
         writeJson(path, cfg);
       }
-      c.log?.(`${harness}: extension entry removed`);
+      c.log?.(`${harness}: extension entry + skill removed`);
     },
   };
 }
 
 const pi = piFamilyInstaller("pi", [".pi", "agent"], [".pi", "agent", "skills"]);
-// Prime Agent reads `~/.prime/agent/skills` the same way pi reads its own, so it could take the
-// companion skill too — deliberately not wired here, only pi was in scope.
-const primeAgent = piFamilyInstaller("prime-agent", [".prime", "agent"]);
+const primeAgent = piFamilyInstaller(
+  "prime-agent",
+  [".prime", "agent"],
+  [".prime", "agent", "skills"]
+);
 
 /**
  * Kilo Code CLI — an opencode fork, so registration is opencode's: append our entry to the config's
