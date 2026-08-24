@@ -1231,13 +1231,14 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     # prefix — it is low-cardinality and keyed by the cache fingerprint.
     language_section = default_language_section(_DEFAULT_LANGUAGE_RULE, config.llm_output_language)
 
-    # Select base prompt based on extraction mode. Every template takes the same two
-    # placeholders; only custom mode with instructions to substitute takes a third, so the
-    # modes differ in which constant they name, not in how they are filled.
-    mode_extras: dict[str, str] = {}
+    # Select base prompt based on extraction mode. The modes differ in which constant they
+    # name, not in how it is filled: only the custom template references
+    # {custom_instructions}, and ``str.format`` ignores a keyword no template mentions, so
+    # all four can be filled by one call.
+    custom_instructions = ""
     if extraction_mode == "custom" and config.retain_custom_instructions:
         base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
-        mode_extras["custom_instructions"] = escape_for_prompt(config.retain_custom_instructions)
+        custom_instructions = escape_for_prompt(config.retain_custom_instructions)
     elif extraction_mode == "verbose":
         base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
     elif extraction_mode == "verbatim":
@@ -1249,7 +1250,7 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     prompt = base_prompt.format(
         language_section=language_section,
         retain_mission_section=retain_mission_section,
-        **mode_extras,
+        custom_instructions=custom_instructions,
     )
 
     # Add causal relationships section if enabled
