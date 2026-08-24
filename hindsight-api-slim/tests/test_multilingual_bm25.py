@@ -230,6 +230,33 @@ def test_reflect_preserves_mission_alongside_directive():
     assert "Respond exclusively in Spanish" in prompt
 
 
+def test_reflect_directive_replaces_source_language_rule():
+    """Reflect follows retain and consolidation: an explicit output language drops the
+    answer-in-the-question's-language default instead of contradicting it.
+
+    The rule defers to "a directive above", but the output-language directive is appended
+    at the very END of the prompt — so before this it never took precedence, and a
+    configured language was silently no-opped for reflect answers.
+    """
+    from hindsight_api.engine.reflect.prompts import _FINAL_LANGUAGE_RULE
+
+    prompt = build_final_system_prompt(mission=None, llm_output_language="Korean")
+
+    assert _FINAL_LANGUAGE_RULE not in prompt
+    assert output_language_directive("Korean") in prompt
+
+
+def test_reflect_unset_requires_source_language():
+    """With no configured language the default rule must still be there — without it
+    weaker models drift to English on a non-English question."""
+    from hindsight_api.engine.reflect.prompts import _FINAL_LANGUAGE_RULE
+
+    prompt = build_final_system_prompt(mission=None, llm_output_language=None)
+
+    assert _FINAL_LANGUAGE_RULE in prompt
+    assert "Respond exclusively in" not in prompt
+
+
 # ---------------------------------------------------------------------------
 # Migration shape regression test
 # ---------------------------------------------------------------------------

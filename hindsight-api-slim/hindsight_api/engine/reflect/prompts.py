@@ -832,6 +832,13 @@ CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, of
 # be repeated for the answer-writing model. Without it, weaker models drift to
 # English even when the question/facts are in another language or a directive
 # demands a specific one (the cause of flaky multilingual reflect tests).
+#
+# Emitted only when no output language is configured — see default_language_section().
+# The escape hatch below defers to a directive "above", but output_language_directive()
+# is appended at the very END of the prompt, so it never triggered: with a configured
+# language the model saw this rule first, phrased more forcefully, and answered in the
+# question's language instead. Retain and consolidation drop their rule for exactly this
+# reason (#3776); reflect now does too.
 _FINAL_LANGUAGE_RULE = (
     "## LANGUAGE\n"
     "- Respond in the SAME language as the user's question "
@@ -852,15 +859,21 @@ def build_final_system_prompt(
     but the final answer is a separate call) so output-constraining rules — most
     visibly response language — are honoured by the model that actually writes
     the answer. When ``llm_output_language`` is set it forces that language
-    regardless of the query/source/directive language (config override wins).
+    regardless of the query/source/directive language (config override wins), and
+    the answer-in-the-question's-language default is dropped rather than left to
+    contradict it.
     """
-    from hindsight_api.engine.prompt_utils import escape_for_prompt, output_language_directive
+    from hindsight_api.engine.prompt_utils import (
+        default_language_section,
+        escape_for_prompt,
+        output_language_directive,
+    )
 
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
     parts.append(_FINAL_SYSTEM_PROMPT_BASE.format(role_section=role_section))
-    parts.append(_FINAL_LANGUAGE_RULE)
+    parts.append(default_language_section(_FINAL_LANGUAGE_RULE, llm_output_language))
     parts.append(build_directives_reminder(directives) if directives else "")
     # Volatile "now" reference last, so the static/per-bank instructions above
     # remain a cacheable prefix and only this timestamp falls outside the cache.
