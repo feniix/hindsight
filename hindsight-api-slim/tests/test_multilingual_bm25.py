@@ -94,6 +94,48 @@ def test_retain_directive_appears_after_base_prompt():
     assert directive_idx > 100
 
 
+@pytest.mark.parametrize("mode", ["concise", "verbose", "verbatim", "custom"])
+def test_retain_directive_replaces_source_language_rule(mode):
+    """An explicit output language wins outright: the source-language default is
+    dropped rather than left to contradict "translate everything into X".
+
+    Retain's default rule is phrased far more forcefully than the appended
+    directive ("STRICTLY FORBIDDEN from translating" vs "Respond exclusively
+    in X") and comes first, so leaving both in place makes the model keep
+    emitting source-language facts and silently no-ops the setting. Mirrors
+    ``test_consolidation_directive_replaces_source_language_rule``.
+    """
+    config = _baseline_config()
+    config.retain_extraction_mode = mode
+    config.retain_custom_instructions = "Extract only product mentions." if mode == "custom" else None
+    config.llm_output_language = "English"
+
+    prompt, _ = _build_extraction_prompt_and_schema(config)
+
+    assert "STRICTLY FORBIDDEN from translating" not in prompt
+    assert "in the same language as the input" not in prompt
+    assert "Respond exclusively in English" in prompt
+
+
+@pytest.mark.parametrize("mode", ["concise", "verbose", "verbatim", "custom"])
+def test_retain_unset_requires_source_language(mode):
+    """With no configured language, retain must still be told to keep the output
+    in the input's language (#181) - otherwise the all-English extraction prompt
+    makes multilingual models drift. Removing the rule outright would regress that,
+    so this pins the default half of the mutual exclusion.
+    """
+    config = _baseline_config()
+    config.retain_extraction_mode = mode
+    config.retain_custom_instructions = "Extract only product mentions." if mode == "custom" else None
+    config.llm_output_language = None
+
+    prompt, _ = _build_extraction_prompt_and_schema(config)
+
+    assert "LANGUAGE: MANDATORY" in prompt
+    assert "STRICTLY FORBIDDEN from translating" in prompt
+    assert "Respond exclusively in" not in prompt
+
+
 def test_retain_works_with_custom_mode():
     """Custom extraction mode + llm_output_language: directive must still appear."""
     config = _baseline_config()

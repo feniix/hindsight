@@ -815,13 +815,24 @@ def _iter_jsonl_chunks(text: str, max_chars: int, structured_limit: int) -> Iter
 # FACT EXTRACTION PROMPTS
 # =============================================================================
 
+# Emitted only when no output language is configured. Fact extraction runs on an
+# English prompt, so without this a multilingual model drifts to English (or, per
+# #181, to an unrelated language entirely) on non-English input. Consolidation
+# carries the equivalent rule, making "preserve the source language" the
+# pipeline-wide default.
+#
+# When HINDSIGHT_API_LLM_OUTPUT_LANGUAGE IS set this section is omitted and
+# output_language_directive() takes over — the two must never both be present or
+# they contradict each other, and the model follows this one because it comes
+# first and is phrased more forcefully.
+_DEFAULT_LANGUAGE_RULE = """LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance."""
+
+
 # Base prompt template (shared by concise and custom modes)
 # Uses {extraction_guidelines} placeholder for mode-specific instructions
 _BASE_FACT_EXTRACTION_PROMPT = """Extract SIGNIFICANT facts from text. Be SELECTIVE - only extract facts worth remembering long-term.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}{extraction_guidelines}
+{language_section}{retain_mission_section}{extraction_guidelines}
 
 ══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - BE CONCISE
@@ -935,6 +946,7 @@ an experience or person."""
 
 # Assembled concise prompt
 CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_CONCISE_GUIDELINES,
     examples=_CONCISE_EXAMPLES,
@@ -942,6 +954,7 @@ CONCISE_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 
 # Custom prompt uses same base but without examples
 CUSTOM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines="{custom_instructions}",
     examples="",  # No examples for custom mode
@@ -963,6 +976,7 @@ RULES:
 - fact_type: use "world" for user preferences, rules, corrections, constraints, traits, and other objective facts, even when stated during an assistant interaction. Use "assistant" only for actions or experiences the assistant/agent actually performed."""
 
 VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
+    language_section="{language_section}",
     retain_mission_section="{retain_mission_section}",
     extraction_guidelines=_VERBATIM_GUIDELINES,
     examples="",
@@ -972,9 +986,7 @@ VERBATIM_FACT_EXTRACTION_PROMPT = _BASE_FACT_EXTRACTION_PROMPT.format(
 # Verbose extraction prompt - detailed, comprehensive facts (legacy mode)
 VERBOSE_FACT_EXTRACTION_PROMPT = """Extract facts from text into structured format with FIVE required dimensions - BE EXTREMELY DETAILED.
 
-LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance.
-
-{retain_mission_section}══════════════════════════════════════════════════════════════════════════
+{language_section}{retain_mission_section}══════════════════════════════════════════════════════════════════════════
 FACT FORMAT - ALL FIVE DIMENSIONS REQUIRED - MAXIMUM VERBOSITY
 ══════════════════════════════════════════════════════════════════════════
 
@@ -1219,30 +1231,43 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
 
     retain_mission_section = ""
 
+    # An explicit output language wins outright: drop the preserve-the-source-language
+    # default rather than leave it to contradict "translate everything into X", which
+    # is the contradiction the model resolves in favour of the rule above. The directive
+    # appended at the end of this function then stands alone. Mirrors
+    # build_consolidation_system_prompt(). This toggle may change the cacheable prefix
+    # — it is low-cardinality and keyed by the cache fingerprint.
+    language_section = "" if config.llm_output_language else f"{_DEFAULT_LANGUAGE_RULE}\n\n"
+
     # Select base prompt based on extraction mode
     if extraction_mode == "custom":
         if not config.retain_custom_instructions:
             base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
             prompt = base_prompt.format(
+                language_section=language_section,
                 retain_mission_section=retain_mission_section,
             )
         else:
             base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
             prompt = base_prompt.format(
+                language_section=language_section,
                 retain_mission_section=retain_mission_section,
                 custom_instructions=escape_for_prompt(config.retain_custom_instructions),
             )
     elif extraction_mode == "verbose":
         prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
+            language_section=language_section,
             retain_mission_section=retain_mission_section,
         )
     elif extraction_mode == "verbatim":
         prompt = VERBATIM_FACT_EXTRACTION_PROMPT.format(
+            language_section=language_section,
             retain_mission_section=retain_mission_section,
         )
     else:
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
         prompt = base_prompt.format(
+            language_section=language_section,
             retain_mission_section=retain_mission_section,
         )
 
