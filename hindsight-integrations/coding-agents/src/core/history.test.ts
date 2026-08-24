@@ -275,6 +275,20 @@ describe("pi-family history import", () => {
     );
   });
 
+  // Regression: the prefilter hands each matching NAME to readdirSync, so a regular file named like
+  // a session folder threw ENOTDIR out of importLocalHistory — which documents that it never throws,
+  // and whose caller does not catch. One junk file killed the whole --import-conversations run.
+  it("skips a stray file where a pi session folder was expected, keeping the real sessions", () => {
+    const h = newHome();
+    const repo = "/Users/x/dev/myrepo";
+    writePiSession(h, repo, "s1", piMessage("user", "real work"));
+    writeFileSync(join(h, ".pi", "agent", "sessions", piSessionDir(`${repo}/sub`)), "not a folder");
+
+    const r = importLocalHistory("pi", repo, h);
+    expect(r.sessions).toHaveLength(1);
+    expect(JSON.stringify(r.sessions)).toContain("real work");
+  });
+
   it("reads Prime Agent sessions out of its FLAT directory, attributing by header cwd", () => {
     const h = newHome();
     const repo = "/Users/x/dev/myrepo";
