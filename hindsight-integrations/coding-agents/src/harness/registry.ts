@@ -48,7 +48,9 @@ export const HARNESS_NAMES = [
   // DeepSeek Harness loads dist/dsh.js as a native Cordis plugin (src/dsh.ts). Its Claude Code /
   // Codex hook bridges are optional packages, so there is no hook binary to install either.
   "dsh",
-  // Prime Agent loads dist/prime-agent.js as an extension (src/prime-agent.ts); no hook binary.
+  // pi loads dist/pi.js as an extension (src/pi.ts), and Prime Agent — a fork of pi — loads
+  // dist/prime-agent.js the same way (src/prime-agent.ts). Neither has a hook binary.
+  "pi",
   "prime-agent",
   "claude-code",
   "cursor-cli",
@@ -75,6 +77,7 @@ const PLUGIN_ENTRYPOINTS: Record<string, string> = {
   opencode: "src/index.ts",
   kilo: "src/kilo.ts",
   "cline-cli": "src/cline.ts",
+  pi: "src/pi.ts",
   "prime-agent": "src/prime-agent.ts",
   dsh: "src/dsh.ts",
 };

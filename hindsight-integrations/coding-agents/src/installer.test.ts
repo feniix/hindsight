@@ -521,37 +521,67 @@ describe("opencode installer", () => {
   });
 });
 
-describe("prime-agent installer", () => {
-  const cfgPath = (ctx: InstallCtx) => join(ctx.home, ".prime", "agent", "settings.json");
-  const entry = (ctx: InstallCtx) => join(ctx.pkgRoot, "dist", "prime-agent.js");
+// pi and Prime Agent share one installer factory but must stay independently wired: each writes
+// only its own settings.json, and each registers the bundle that reports its own harness.
+describe.each([
+  { harness: "pi", dir: [".pi", "agent"] },
+  { harness: "prime-agent", dir: [".prime", "agent"] },
+])("$harness installer", ({ harness, dir }) => {
+  const cfgPath = (ctx: InstallCtx) => join(ctx.home, ...dir, "settings.json");
+  const entry = (ctx: InstallCtx) => join(ctx.pkgRoot, "dist", `${harness}.js`);
 
   it("install adds the built extension to the extensions array exactly once, even across reinstalls", () => {
     const ctx = makeCtx();
-    expect(run(["install", "prime-agent"], ctx)).toBe(0);
-    run(["install", "prime-agent"], ctx);
+    expect(run(["install", harness], ctx)).toBe(0);
+    run(["install", harness], ctx);
     expect(readJson(cfgPath(ctx)).extensions).toEqual([entry(ctx)]);
   });
 
   it("preserves other extension entries", () => {
     const ctx = makeCtx();
     writeJsonAt(cfgPath(ctx), { extensions: ["/some/other/ext.js"] });
-    run(["install", "prime-agent"], ctx);
+    run(["install", harness], ctx);
     expect(readJson(cfgPath(ctx)).extensions).toEqual(["/some/other/ext.js", entry(ctx)]);
   });
 
   it("uninstall removes our entry and deletes the extensions key when empty", () => {
     const ctx = makeCtx();
-    run(["install", "prime-agent"], ctx);
-    run(["uninstall", "prime-agent"], ctx);
+    run(["install", harness], ctx);
+    run(["uninstall", harness], ctx);
     expect(readJson(cfgPath(ctx)).extensions).toBeUndefined();
   });
 
   it("uninstall keeps the extensions key when other entries remain", () => {
     const ctx = makeCtx();
     writeJsonAt(cfgPath(ctx), { extensions: ["/some/other/ext.js"] });
+    run(["install", harness], ctx);
+    run(["uninstall", harness], ctx);
+    expect(readJson(cfgPath(ctx)).extensions).toEqual(["/some/other/ext.js"]);
+  });
+});
+
+describe("pi and prime-agent do not disturb each other", () => {
+  const piCfg = (ctx: InstallCtx) => join(ctx.home, ".pi", "agent", "settings.json");
+  const primeCfg = (ctx: InstallCtx) => join(ctx.home, ".prime", "agent", "settings.json");
+
+  it("wires each host to its own bundle and leaves the other config untouched", () => {
+    const ctx = makeCtx();
+    run(["install", "pi"], ctx);
+    expect(existsSync(primeCfg(ctx))).toBe(false);
+
+    run(["install", "prime-agent"], ctx);
+    expect(readJson(piCfg(ctx)).extensions).toEqual([join(ctx.pkgRoot, "dist", "pi.js")]);
+    expect(readJson(primeCfg(ctx)).extensions).toEqual([
+      join(ctx.pkgRoot, "dist", "prime-agent.js"),
+    ]);
+  });
+
+  it("uninstalling one leaves the other wired", () => {
+    const ctx = makeCtx();
+    run(["install", "pi"], ctx);
     run(["install", "prime-agent"], ctx);
     run(["uninstall", "prime-agent"], ctx);
-    expect(readJson(cfgPath(ctx)).extensions).toEqual(["/some/other/ext.js"]);
+    expect(readJson(piCfg(ctx)).extensions).toEqual([join(ctx.pkgRoot, "dist", "pi.js")]);
   });
 });
 
@@ -703,6 +733,7 @@ describe("run() CLI behavior", () => {
     expect(INSTALLERS.map((i) => i.name)).toEqual([
       "opencode",
       "kilo",
+      "pi",
       "prime-agent",
       "claude-code",
       "codex",
@@ -736,9 +767,9 @@ describe("MCP registrations name the calling harness", () => {
   }
 
   // These hosts have no MCP registration at all: they load our plugin/extension in-process
-  // (src/kilo.ts, src/dsh.ts, src/prime-agent.ts, dist/index.js for opencode), and that entry
-  // hands its own harness name straight to RuntimeCore.
-  const IN_PROCESS = new Set(["opencode", "kilo", "prime-agent", "dsh"]);
+  // (src/kilo.ts, src/dsh.ts, src/pi.ts, src/prime-agent.ts, dist/index.js for opencode), and that
+  // entry hands its own harness name straight to RuntimeCore.
+  const IN_PROCESS = new Set(["opencode", "kilo", "pi", "prime-agent", "dsh"]);
   const MCP_HOSTS = INSTALLERS.map((i) => i.name).filter((n) => !IN_PROCESS.has(n));
 
   it.each(MCP_HOSTS)("%s", (harness) => {

@@ -8,6 +8,7 @@ describe("HARNESS_NAMES", () => {
         "opencode",
         "kilo",
         "cline-cli",
+        "pi",
         "prime-agent",
         "dsh",
         "claude-code",
@@ -19,7 +20,7 @@ describe("HARNESS_NAMES", () => {
         "grok-build",
       ])
     );
-    expect(HARNESS_NAMES).toHaveLength(12);
+    expect(HARNESS_NAMES).toHaveLength(13);
   });
 });
 
@@ -48,6 +49,20 @@ describe("getHarness", () => {
     const adapter = await getHarness("cline-cli");
     expect(adapter.name).toBe("cline-cli");
     expect(() => adapter.createRuntime({} as never)).toThrow(/src\/cline\.ts/);
+  });
+
+  it("resolves pi and its Prime Agent fork as separate extension harnesses", async () => {
+    for (const [name, entry] of [
+      ["pi", /src\/pi\.ts/],
+      ["prime-agent", /src\/prime-agent\.ts/],
+    ] as const) {
+      const adapter = await getHarness(name);
+      expect(adapter.name).toBe(name);
+      // Both drive the same shared adapter (harness/pi-extension.ts) but are wired by their own
+      // entrypoint, so each must resolve to its own dist bundle — swapping them would silently
+      // retain one host's sessions under the other's bank.
+      expect(() => adapter.createRuntime({} as never)).toThrow(entry);
+    }
   });
 
   it("resolves DeepSeek Harness as a native Cordis-plugin harness", async () => {
