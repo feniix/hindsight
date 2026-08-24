@@ -741,7 +741,6 @@ class _SubBatch:
     origins: list[int]
     document_body: "ScreenedDocumentBody | None"
     chunk_count: int
-    index: int  # 1-based, for logging and the is-first-batch decision
     is_last: bool
 
 
@@ -1042,32 +1041,24 @@ def iter_sub_batches(
             last_body, last_screened = body, _screen_document_body(body, config)
         return last_screened
 
-    index = 0
+    def _finish(raw: _RawSubBatch, *, is_last: bool) -> _SubBatch:
+        return _SubBatch(
+            contents=raw.contents,
+            origins=raw.origins,
+            document_body=_screen(raw.body_override),
+            chunk_count=raw.chunk_count,
+            is_last=is_last,
+        )
+
     held: _RawSubBatch | None = None
     for raw in _iter_raw_sub_batches(
         contents, tokens_per_batch, chunk_size=chunk_size, structured_chunk_size=structured_chunk_size
     ):
         if held is not None:
-            index += 1
-            yield _SubBatch(
-                contents=held.contents,
-                origins=held.origins,
-                document_body=_screen(held.body_override),
-                chunk_count=held.chunk_count,
-                index=index,
-                is_last=False,
-            )
+            yield _finish(held, is_last=False)
         held = raw
     if held is not None:
-        index += 1
-        yield _SubBatch(
-            contents=held.contents,
-            origins=held.origins,
-            document_body=_screen(held.body_override),
-            chunk_count=held.chunk_count,
-            index=index,
-            is_last=True,
-        )
+        yield _finish(held, is_last=True)
 
 
 def _split_contents_into_async_children(
@@ -5266,7 +5257,7 @@ class MemoryEngine(MemoryEngineInterface):
             # them all costs a second copy of it for the whole retain (#3756). Each is
             # screened, hashed and flagged as it arrives; ``is_last`` comes from a
             # one-item lookahead inside the generator, because there is no length to
-            # compare ``i`` against any more.
+            # compare the loop counter against any more.
             sub_batch_stream = iter_sub_batches(
                 contents,
                 tokens_per_batch,
@@ -5332,9 +5323,10 @@ class MemoryEngine(MemoryEngineInterface):
                         )
                     )
 
+            # Counts the sub-batches actually processed, for the completion log. The
+            # stream has no length, so this is the only place the total exists.
             sub_batches_run = 0
-            for sub in sub_batch_stream:
-                i = sub.index
+            for i, sub in enumerate(sub_batch_stream, 1):
                 sub_batch = sub.contents
                 sub_origins = sub.origins
                 # Checkpoint: abort if the operation was deleted (bank was deleted) between sub-batches.
