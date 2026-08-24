@@ -1,6 +1,6 @@
 """An oversized document's body is screened and hashed once, not once per slice (#3756).
 
-``collect_sub_batches`` hands every slice of an oversized item the same full
+The splitter hands every slice of an oversized item the same full
 body to write as ``documents.original_text``. The retain path then sanitized and SHA-256'd
 that body to derive the document's ``content_hash`` — on every slice. A 45 MB body splits
 into ~1,200 slices at the default budget and costs ~0.9s per hash, so ~18 minutes went into
@@ -69,14 +69,14 @@ def test_sub_batches_that_are_not_slices_carry_no_body_override():
 def test_body_is_screened_and_hashed_once_across_every_slice():
     """One slice's worth of work, however many slices the document produced."""
     contents = [{"content": _BODY, "document_id": "doc-sliced"}]
-    split = collect_sub_batches(contents, 200, chunk_size=500, structured_chunk_size=None)
+    subs = collect_sub_batches(contents, 200, chunk_size=500, structured_chunk_size=None)
     # The premise of the test: this body really does slice into many sub-batches.
-    assert len(split.sub_batches) > 10
-    assert all(body == _BODY for body in split.document_body_overrides)
+    assert len(subs) > 10
+    assert all(sub.body_override == _BODY for sub in subs)
 
     screened = collect_screened_bodies(contents, 200, chunk_size=500, structured_chunk_size=None, config=_config())
 
-    assert len(screened) == len(split.sub_batches)
+    assert len(screened) == len(subs)
     # Every slice gets the identical object, so the redaction ran once and the hash with
     # it — a per-slice implementation would produce equal-but-distinct instances.
     first = screened[0]
