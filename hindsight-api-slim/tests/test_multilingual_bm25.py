@@ -17,6 +17,9 @@ import pytest
 
 from hindsight_api.engine.prompt_utils import output_language_directive
 from hindsight_api.engine.reflect.prompts import build_final_system_prompt
+from hindsight_api.engine.retain.fact_extraction import (
+    _DEFAULT_LANGUAGE_RULE as _RETAIN_DEFAULT_LANGUAGE_RULE,
+)
 from hindsight_api.engine.retain.fact_extraction import _build_extraction_prompt_and_schema
 from hindsight_api.engine.search import retrieval as retrieval_mod
 from hindsight_api.engine.search.retrieval import tokenize_query
@@ -112,9 +115,8 @@ def test_retain_directive_replaces_source_language_rule(mode):
 
     prompt, _ = _build_extraction_prompt_and_schema(config)
 
-    assert "STRICTLY FORBIDDEN from translating" not in prompt
-    assert "in the same language as the input" not in prompt
-    assert "Respond exclusively in English" in prompt
+    assert _RETAIN_DEFAULT_LANGUAGE_RULE not in prompt
+    assert output_language_directive("English") in prompt
 
 
 @pytest.mark.parametrize("mode", ["concise", "verbose", "verbatim", "custom"])
@@ -131,8 +133,7 @@ def test_retain_unset_requires_source_language(mode):
 
     prompt, _ = _build_extraction_prompt_and_schema(config)
 
-    assert "LANGUAGE: MANDATORY" in prompt
-    assert "STRICTLY FORBIDDEN from translating" in prompt
+    assert _RETAIN_DEFAULT_LANGUAGE_RULE in prompt
     assert "Respond exclusively in" not in prompt
 
 
@@ -187,11 +188,14 @@ def test_consolidation_injects_directive():
 def test_consolidation_directive_replaces_source_language_rule():
     """An explicit output language wins outright: the source-language default is
     dropped rather than left to contradict "translate everything into X"."""
-    from hindsight_api.engine.consolidation.prompts import build_consolidation_system_prompt
+    from hindsight_api.engine.consolidation.prompts import (
+        _DEFAULT_LANGUAGE_RULE,
+        build_consolidation_system_prompt,
+    )
 
     prompt = build_consolidation_system_prompt(llm_output_language="Chinese")
-    assert "## LANGUAGE" not in prompt
-    assert "language of its own source facts" not in prompt
+    assert _DEFAULT_LANGUAGE_RULE not in prompt
+    assert output_language_directive("Chinese") in prompt
 
 
 def test_consolidation_directive_does_not_break_format_placeholders():

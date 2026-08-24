@@ -815,16 +815,12 @@ def _iter_jsonl_chunks(text: str, max_chars: int, structured_limit: int) -> Iter
 # FACT EXTRACTION PROMPTS
 # =============================================================================
 
-# Emitted only when no output language is configured. Fact extraction runs on an
-# English prompt, so without this a multilingual model drifts to English (or, per
-# #181, to an unrelated language entirely) on non-English input. Consolidation
-# carries the equivalent rule, making "preserve the source language" the
-# pipeline-wide default.
-#
-# When HINDSIGHT_API_LLM_OUTPUT_LANGUAGE IS set this section is omitted and
-# output_language_directive() takes over — the two must never both be present or
-# they contradict each other, and the model follows this one because it comes
-# first and is phrased more forcefully.
+# Retain's wording of the preserve-the-source-language rule; the selection between it
+# and an explicit output language belongs to default_language_section(), which documents
+# the invariant. Without it, fact extraction runs on an all-English prompt and a
+# multilingual model drifts to English (or, per #181, to an unrelated language entirely)
+# on non-English input. Consolidation carries the equivalent rule, making "preserve the
+# source language" the pipeline-wide default.
 _DEFAULT_LANGUAGE_RULE = """LANGUAGE: MANDATORY — Detect the language of the input text and produce ALL output in that EXACT same language. You are STRICTLY FORBIDDEN from translating or switching to any other language. Every single word of your output must be in the same language as the input. Do NOT output in a different language under any circumstance."""
 
 
@@ -1227,49 +1223,34 @@ def _build_extraction_prompt_and_schema(config) -> tuple[str, type]:
     # CachedContent serves every bank, and the mission rides in the per-request
     # user message via _retain_mission_preamble(). The {retain_mission_section}
     # placeholder is kept (templates still reference it) but always empty here.
-    from hindsight_api.engine.prompt_utils import escape_for_prompt
+    from hindsight_api.engine.prompt_utils import default_language_section, escape_for_prompt
 
     retain_mission_section = ""
 
-    # An explicit output language wins outright: drop the preserve-the-source-language
-    # default rather than leave it to contradict "translate everything into X", which
-    # is the contradiction the model resolves in favour of the rule above. The directive
-    # appended at the end of this function then stands alone. Mirrors
-    # build_consolidation_system_prompt(). This toggle may change the cacheable prefix
-    # — it is low-cardinality and keyed by the cache fingerprint.
-    language_section = "" if config.llm_output_language else f"{_DEFAULT_LANGUAGE_RULE}\n\n"
+    # Mirrors build_consolidation_system_prompt(). This toggle may change the cacheable
+    # prefix — it is low-cardinality and keyed by the cache fingerprint.
+    language_section = default_language_section(_DEFAULT_LANGUAGE_RULE, config.llm_output_language)
 
-    # Select base prompt based on extraction mode
-    if extraction_mode == "custom":
-        if not config.retain_custom_instructions:
-            base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                language_section=language_section,
-                retain_mission_section=retain_mission_section,
-            )
-        else:
-            base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
-            prompt = base_prompt.format(
-                language_section=language_section,
-                retain_mission_section=retain_mission_section,
-                custom_instructions=escape_for_prompt(config.retain_custom_instructions),
-            )
+    # Select base prompt based on extraction mode. Every template takes the same two
+    # placeholders; only custom mode with instructions to substitute takes a third, so the
+    # modes differ in which constant they name, not in how they are filled.
+    mode_extras: dict[str, str] = {}
+    if extraction_mode == "custom" and config.retain_custom_instructions:
+        base_prompt = CUSTOM_FACT_EXTRACTION_PROMPT
+        mode_extras["custom_instructions"] = escape_for_prompt(config.retain_custom_instructions)
     elif extraction_mode == "verbose":
-        prompt = VERBOSE_FACT_EXTRACTION_PROMPT.format(
-            language_section=language_section,
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBOSE_FACT_EXTRACTION_PROMPT
     elif extraction_mode == "verbatim":
-        prompt = VERBATIM_FACT_EXTRACTION_PROMPT.format(
-            language_section=language_section,
-            retain_mission_section=retain_mission_section,
-        )
+        base_prompt = VERBATIM_FACT_EXTRACTION_PROMPT
     else:
+        # Concise is the default, and also what custom mode falls back to with no
+        # instructions configured — there is nothing to substitute into the custom template.
         base_prompt = CONCISE_FACT_EXTRACTION_PROMPT
-        prompt = base_prompt.format(
-            language_section=language_section,
-            retain_mission_section=retain_mission_section,
-        )
+    prompt = base_prompt.format(
+        language_section=language_section,
+        retain_mission_section=retain_mission_section,
+        **mode_extras,
+    )
 
     # Add causal relationships section if enabled
     # Verbatim mode never uses causal relations (no fact text to relate causally)
