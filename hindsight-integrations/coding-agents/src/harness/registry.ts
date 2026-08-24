@@ -72,8 +72,10 @@ const HOOK_BINS: Record<string, string> = {
   // more hook harnesses: add a HookSpec entry point (see src/cursor-hook.ts) + a registration here.
 };
 
-/** Where each persistent-plugin harness's runtime is actually built (see the branch below). */
-const PLUGIN_ENTRYPOINTS: Record<string, string> = {
+/** Where each persistent-plugin harness's runtime is actually built (see the branch below).
+ *  Exported so a test can assert, over the whole family, that each of those files reports the
+ *  harness mapped to it here — see registry.test.ts. */
+export const PLUGIN_ENTRYPOINTS: Record<string, string> = {
   opencode: "src/index.ts",
   kilo: "src/kilo.ts",
   "cline-cli": "src/cline.ts",

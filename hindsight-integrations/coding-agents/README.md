@@ -123,7 +123,8 @@ A native plugin via `cline plugin install`, plus MCP and the companion skill.
 npx @vectorize-io/hindsight-coding-agents install pi
 ```
 
-An extension entry in `~/.pi/agent/settings.json` — native tools, no MCP needed. Use this command
+An extension entry in `~/.pi/agent/settings.json`, plus the companion skill in
+`~/.pi/agent/skills` — native tools, no MCP needed. Use this command
 rather than `pi install npm:@vectorize-io/hindsight-coding-agents`: pi and Prime Agent read the same
 `pi` key of a package's `package.json`, which can only name one entry, and it names Prime Agent's —
 so on the package route pi would report itself as `prime-agent`, taking that harness's config

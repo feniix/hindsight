@@ -560,6 +560,55 @@ describe.each([
   });
 });
 
+describe("pi companion skill", () => {
+  // pi discovers `~/.pi/agent/skills` and the shared `~/.agents/skills`. We write pi's OWN
+  // directory: the shared root is where Codex and dsh install, and uninstallSkill removes by a
+  // fixed name, so installing there would make `uninstall pi` delete their copy too.
+  const skillDir = (ctx: InstallCtx) => join(ctx.home, ".pi", "agent", "skills");
+
+  /** makeCtx's pkgRoot is a synthetic /opt path that does not exist, so the packaged skill can't be
+   *  staged in it. Build a real temp package root instead, like the cross-host skill test below. */
+  function ctxWithSkill(): InstallCtx {
+    const home = mkdtempSync(join(tmpdir(), "hs-inst-pi-skill-"));
+    homes.push(home);
+    const pkgRoot = mkdtempSync(join(tmpdir(), "hs-pkg-"));
+    homes.push(pkgRoot);
+    mkdirSync(join(pkgRoot, "skill"), { recursive: true });
+    writeFileSync(
+      join(pkgRoot, "skill", "SKILL.md"),
+      "---\nname: hindsight-coding-agent\n---\nbody"
+    );
+    return { home, pkgRoot, dist: join(pkgRoot, "dist"), claudeMcp: vi.fn(() => true) };
+  }
+
+  it("installs the packaged skill into pi's own skills directory and removes it on uninstall", () => {
+    const ctx = ctxWithSkill();
+    run(["install", "pi"], ctx);
+    expect(existsSync(join(skillDir(ctx), "hindsight-coding-agent", "SKILL.md"))).toBe(true);
+    run(["uninstall", "pi"], ctx);
+    expect(existsSync(join(skillDir(ctx), "hindsight-coding-agent"))).toBe(false);
+  });
+
+  it("leaves the shared ~/.agents/skills root alone, so uninstalling pi cannot strip Codex's copy", () => {
+    const ctx = ctxWithSkill();
+    run(["install", "codex"], ctx);
+    const shared = join(ctx.home, ".agents", "skills", "hindsight-coding-agent");
+    expect(existsSync(shared)).toBe(true);
+
+    run(["install", "pi"], ctx);
+    run(["uninstall", "pi"], ctx);
+    expect(existsSync(shared)).toBe(true);
+  });
+
+  // Prime Agent reads `~/.prime/agent/skills` and could take the skill too; it deliberately does
+  // not yet, so pin that rather than leave the difference looking accidental.
+  it("does not install a skill for prime-agent", () => {
+    const ctx = ctxWithSkill();
+    run(["install", "prime-agent"], ctx);
+    expect(existsSync(join(ctx.home, ".prime", "agent", "skills"))).toBe(false);
+  });
+});
+
 describe("pi and prime-agent do not disturb each other", () => {
   const piCfg = (ctx: InstallCtx) => join(ctx.home, ".pi", "agent", "settings.json");
   const primeCfg = (ctx: InstallCtx) => join(ctx.home, ".prime", "agent", "settings.json");

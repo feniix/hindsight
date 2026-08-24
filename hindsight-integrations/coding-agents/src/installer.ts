@@ -279,9 +279,18 @@ const opencode: HarnessInstaller = {
  * (`pkg.pi.extensions`) when this package is installed as a distributed pi package, so it can only
  * ever name one bundle. It stays pointed at Prime Agent's; the explicit installs below are how each
  * host gets the entry that reports its own harness.
+ *
+ * `skillsDir` is per-host rather than shared: both read `~/.agents/skills` too, but that is the
+ * root Codex and dsh install into, so putting ours there would make uninstalling one host delete
+ * the other hosts' copy. Each writes its OWN skills directory instead.
  */
-function piFamilyInstaller(harness: string, configDir: string[]): HarnessInstaller {
+function piFamilyInstaller(
+  harness: string,
+  configDir: string[],
+  skillsDir?: string[]
+): HarnessInstaller {
   const settings = (c: InstallCtx) => join(c.home, ...configDir, "settings.json");
+  const skills = (c: InstallCtx) => (skillsDir ? join(c.home, ...skillsDir) : undefined);
   return {
     name: harness,
     // Both hosts name their executable exactly as we name the harness, so the harness id doubles
@@ -294,9 +303,13 @@ function piFamilyInstaller(harness: string, configDir: string[]): HarnessInstall
       const exts: string[] = Array.isArray(cfg.extensions) ? cfg.extensions : [];
       cfg.extensions = [...exts.filter((p) => !String(p).includes(MARKER)), entry];
       writeJson(path, cfg);
+      const skillsBase = skills(c);
+      if (skillsBase) installSkill(c, harness, skillsBase);
       c.log?.(`${harness}: extension registered in ${path}`);
     },
     uninstall(c) {
+      const skillsBase = skills(c);
+      if (skillsBase) uninstallSkill(c, skillsBase);
       const path = settings(c);
       if (!existsSync(path)) return;
       const cfg = readJson(path);
@@ -310,7 +323,9 @@ function piFamilyInstaller(harness: string, configDir: string[]): HarnessInstall
   };
 }
 
-const pi = piFamilyInstaller("pi", [".pi", "agent"]);
+const pi = piFamilyInstaller("pi", [".pi", "agent"], [".pi", "agent", "skills"]);
+// Prime Agent reads `~/.prime/agent/skills` the same way pi reads its own, so it could take the
+// companion skill too — deliberately not wired here, only pi was in scope.
 const primeAgent = piFamilyInstaller("prime-agent", [".prime", "agent"]);
 
 /**
