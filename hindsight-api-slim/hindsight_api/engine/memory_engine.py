@@ -1022,18 +1022,25 @@ def iter_sub_batches(
     """Stream screened, hashed, last-flagged sub-batches ready for the retain loop.
 
     Wraps :func:`_iter_raw_sub_batches` with the two things the loop needs and the raw
-    splitter cannot supply: the Memory Defense screening and content hash of each distinct
-    document body (cached, so an oversized item's identical body is screened once however
-    many slices it produced — issue #3282), and ``is_last``, from a one-item lookahead.
+    splitter cannot supply: the Memory Defense screening and content hash of the document
+    body a slice carries (done once per document, however many slices it produced — issue
+    #3282), and ``is_last``, from a one-item lookahead.
     """
-    screened: dict[str, ScreenedDocumentBody] = {}
+    # A one-entry cache, not a dict keyed by body: every slice of an oversized item is
+    # yielded consecutively and carries the *same string object*, so identity is enough to
+    # hit — and with Memory Defense redaction on, a screened body is a full second copy of
+    # the document. Keeping a dict would hold one such copy per document in the submission
+    # for the whole retain, which is the cost this streaming path exists to remove (#3756).
+    last_body: str | None = None
+    last_screened: ScreenedDocumentBody | None = None
 
     def _screen(body: str | None) -> ScreenedDocumentBody | None:
+        nonlocal last_body, last_screened
         if body is None:
             return None
-        if body not in screened:
-            screened[body] = _screen_document_body(body, config)
-        return screened[body]
+        if body is not last_body:
+            last_body, last_screened = body, _screen_document_body(body, config)
+        return last_screened
 
     index = 0
     held: _RawSubBatch | None = None
