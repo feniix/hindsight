@@ -1,7 +1,7 @@
 /**
- * Prime Agent live-transcript normalizer.
+ * pi live-transcript normalizer — shared by pi and its fork Prime Agent.
  *
- * Prime Agent hands an extension the completed exchange as an in-memory message list on the
+ * These hosts hand an extension the completed exchange as an in-memory message list on the
  * `agent_end` event (not a JSONL file like Claude/Codex), so this is a pure function over that list,
  * mirroring transcript-opencode.ts. It produces the same rich `TransportTurn[]` shape (prose turns +
  * compact `role:"action"` tool turns) and reuses the shared `stripInjectedMemory`/`actionLine`
@@ -11,27 +11,27 @@
 import type { TransportTurn } from "./chat";
 import { actionLine, stripInjectedMemory } from "./transcript-util";
 
-/** Structural subset of a Prime Agent message content block (TextBlock | ToolCallBlock | dropped). */
-export interface PaBlock {
+/** Structural subset of a pi message content block (TextContent | ToolCall | dropped). */
+export interface PiBlock {
   type?: string;
   text?: string; // text block
   name?: string; // toolCall block: the tool name
   arguments?: unknown; // toolCall block: the call input
 }
 
-/** Structural subset of a Prime Agent message ({ role, content }). */
-export interface PaMessage {
+/** Structural subset of a pi message ({ role, content }). */
+export interface PiMessage {
   role?: string;
-  content?: unknown; // string | PaBlock[]
+  content?: unknown; // string | PiBlock[]
 }
 
 /**
- * Render one Prime Agent message into turns. Text (string content or text blocks) joins into one
+ * Render one pi message into turns. Text (string content or text blocks) joins into one
  * prose turn (injected-memory stripped); each `toolCall` block becomes its own compact
  * `role:"action"` turn (tool name + primary target via `actionLine` — no args, no output). Other
  * block types and non-conversational roles are dropped.
  */
-function renderMessage(m: PaMessage): TransportTurn[] {
+function renderMessage(m: PiMessage): TransportTurn[] {
   if (!m || typeof m !== "object") return [];
   const role = m.role;
   if (role !== "user" && role !== "assistant") return [];
@@ -45,7 +45,7 @@ function renderMessage(m: PaMessage): TransportTurn[] {
   } else if (Array.isArray(m.content)) {
     for (const part of m.content) {
       if (!part || typeof part !== "object") continue;
-      const block = part as PaBlock;
+      const block = part as PiBlock;
       if (block.type === "text" && typeof block.text === "string") {
         const t = stripInjectedMemory(block.text).trim();
         if (t) texts.push(t);
@@ -63,9 +63,9 @@ function renderMessage(m: PaMessage): TransportTurn[] {
 }
 
 /**
- * Normalize Prime Agent's `agent_end` message list into transcript turns (user/assistant prose plus
+ * Normalize a pi `agent_end` message list into transcript turns (user/assistant prose plus
  * compact action turns for tool calls). Never throws on malformed entries.
  */
-export function readPrimeAgentMessages(messages: readonly PaMessage[]): TransportTurn[] {
+export function readPiMessages(messages: readonly PiMessage[]): TransportTurn[] {
   return (messages || []).flatMap((m) => renderMessage(m));
 }

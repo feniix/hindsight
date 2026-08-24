@@ -1,11 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { type PaMessage, readPrimeAgentMessages } from "./transcript-prime-agent";
+import { type PiMessage, readPiMessages } from "./transcript-pi";
 
-describe("readPrimeAgentMessages", () => {
+describe("readPiMessages", () => {
   it("keeps user/assistant text + compact action turns; drops other roles/blocks and tool args", () => {
-    const messages: PaMessage[] = [
+    const messages: PiMessage[] = [
       // non-conversational role: dropped
-      { role: "system", content: [{ type: "text", text: "you are prime-agent" }] },
+      { role: "system", content: [{ type: "text", text: "you are pi" }] },
       // string content is accepted as a prose turn
       { role: "user", content: "add retry backoff to the uploader" },
       // assistant message: text + a toolCall (args NOT retained) + a dropped reasoning block
@@ -24,7 +24,7 @@ describe("readPrimeAgentMessages", () => {
       },
     ];
 
-    expect(readPrimeAgentMessages(messages)).toEqual([
+    expect(readPiMessages(messages)).toEqual([
       { role: "user", content: "add retry backoff to the uploader" },
       { role: "assistant", content: "I'll add exponential backoff." },
       { role: "action", content: "bash npm test" },
@@ -33,7 +33,7 @@ describe("readPrimeAgentMessages", () => {
   });
 
   it("strips injected memory that leaks into a kept message", () => {
-    const messages: PaMessage[] = [
+    const messages: PiMessage[] = [
       {
         role: "user",
         content: [
@@ -41,7 +41,7 @@ describe("readPrimeAgentMessages", () => {
         ],
       },
     ];
-    expect(readPrimeAgentMessages(messages)).toEqual([{ role: "user", content: "Why retry?" }]);
+    expect(readPiMessages(messages)).toEqual([{ role: "user", content: "Why retry?" }]);
   });
 
   it("never throws on malformed entries", () => {
@@ -50,8 +50,8 @@ describe("readPrimeAgentMessages", () => {
       {},
       { role: "user" },
       { role: "assistant", content: [null, 3, "x"] },
-    ] as unknown as PaMessage[];
-    expect(() => readPrimeAgentMessages(messages)).not.toThrow();
-    expect(readPrimeAgentMessages(messages)).toEqual([]);
+    ] as unknown as PiMessage[];
+    expect(() => readPiMessages(messages)).not.toThrow();
+    expect(readPiMessages(messages)).toEqual([]);
   });
 });
