@@ -950,10 +950,12 @@ def _iter_raw_sub_batches(
     current_batch_tokens = 0
     current_batch_chunks = 0
 
-    def _flush() -> _RawSubBatch | None:
+    def _flush() -> list[_RawSubBatch]:
+        """The in-flight sub-batch, if there is one — as a list, so the three flush
+        points can ``yield from`` it without each unwrapping an ``Optional``."""
         nonlocal current_batch, current_batch_origins, current_batch_tokens, current_batch_chunks
         if not current_batch:
-            return None
+            return []
         flushed = _RawSubBatch(
             contents=current_batch,
             origins=current_batch_origins,
@@ -964,7 +966,7 @@ def _iter_raw_sub_batches(
         current_batch_origins = []
         current_batch_tokens = 0
         current_batch_chunks = 0
-        return flushed
+        return [flushed]
 
     for original_idx, item in enumerate(contents):
         content_str = item.get("content", "") or ""
@@ -980,9 +982,7 @@ def _iter_raw_sub_batches(
             # writes the full original text to documents.original_text — not
             # just its own slice (otherwise the last slice would clobber the
             # body with a truncated payload; see issue #1838).
-            pending = _flush()
-            if pending is not None:
-                yield pending
+            yield from _flush()
             for run in _pack_native_chunks(_chunks_of(content_str), tokens_per_batch):
                 joined = _rejoin_native_chunks(run, chunk_size, structured_chunk_size)
                 slices = [(joined, len(run))] if joined is not None else [(chunk, 1) for chunk in run]
@@ -997,17 +997,13 @@ def _iter_raw_sub_batches(
             continue
 
         if current_batch and current_batch_tokens + item_tokens > tokens_per_batch:
-            pending = _flush()
-            if pending is not None:
-                yield pending
+            yield from _flush()
         current_batch.append(item)
         current_batch_origins.append(original_idx)
         current_batch_tokens += item_tokens
         current_batch_chunks += sum(1 for _ in _chunks_of(content_str))
 
-    pending = _flush()
-    if pending is not None:
-        yield pending
+    yield from _flush()
 
 
 def iter_sub_batches(
