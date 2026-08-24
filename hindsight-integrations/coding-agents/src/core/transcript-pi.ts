@@ -9,6 +9,7 @@
  * bank.
  */
 import type { TransportTurn } from "./chat";
+import { readJsonlTail } from "./jsonl";
 import { actionLine, stripInjectedMemory } from "./transcript-util";
 
 /** Structural subset of a pi message content block (TextContent | ToolCall | dropped). */
@@ -23,6 +24,15 @@ export interface PiBlock {
 export interface PiMessage {
   role?: string;
   content?: unknown; // string | PiBlock[]
+}
+
+/** Structural subset of one line of a stored pi session (`~/.pi/agent/sessions/**\/*.jsonl`).
+ *  Conversation lives in `type:"message"` entries; the file's first line is the `type:"session"`
+ *  header (id + cwd) and the rest are settings changes, which carry no conversation. */
+interface PiEntry {
+  type?: string;
+  timestamp?: string;
+  message?: PiMessage;
 }
 
 /**
@@ -68,4 +78,40 @@ function renderMessage(m: PiMessage): TransportTurn[] {
  */
 export function readPiMessages(messages: readonly PiMessage[]): TransportTurn[] {
   return (messages || []).flatMap((m) => renderMessage(m));
+}
+
+/**
+ * Read a STORED pi session file (the history-import path) into the same turns the live `agent_end`
+ * path produces.
+ *
+ * pi and its fork Prime Agent both persist a session as JSONL whose conversation entries wrap
+ * exactly the message objects the live event hands over, so this shares `renderMessage` with
+ * readPiMessages rather than re-deriving the normalization — an imported session and a live one
+ * must reach the bank identically. `toolResult` entries are dropped with every other
+ * non-conversational role, matching how the Codex reader drops `function_call_output`.
+ *
+ * Bounded and fail-open like the other stored-transcript readers: a missing file, a torn line or a
+ * transcript past the size cap yields fewer turns, never a throw (see core/jsonl.ts).
+ */
+export function readPiTranscript(path: string): TransportTurn[] {
+  const turns: TransportTurn[] = [];
+  for (const rawLine of readJsonlTail(path, { scope: "pi" }).lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const entry = parsed as PiEntry;
+    if (entry.type !== "message" || !entry.message) continue;
+    // The entry's timestamp, not the inner message's: the outer one is the ISO string every other
+    // reader's turns carry, while the inner is epoch milliseconds.
+    for (const turn of renderMessage(entry.message)) {
+      turns.push(entry.timestamp ? { ...turn, timestamp: entry.timestamp } : turn);
+    }
+  }
+  return turns;
 }

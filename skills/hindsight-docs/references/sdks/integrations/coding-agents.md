@@ -223,7 +223,8 @@ transcripts are needed either way; going through them directly is simply the sho
 **How sessions are matched.** A conversation is imported only when the session itself records the
 directory it ran in — never inferred from a file or folder name. Claude Code writes that directory
 on its entries, Codex in its `session_meta` header and DeepSeek Harness in its session-log header,
-so all three can be attributed exactly, including sessions started in a subdirectory of the repo. Guessing was tempting (Claude names its history
+and pi and Prime Agent in their session header, so all five can be attributed exactly, including
+sessions started in a subdirectory of the repo. Guessing was tempting (Claude names its history
 folders after the project path) but unsafe: `/` and `.` both encode to `-`, so `repo-sub` is either
 the subdirectory `repo/sub` or an unrelated sibling repo — and a wrong guess files someone else's
 conversation into your bank. Sessions that record nothing are skipped and the count is reported.
