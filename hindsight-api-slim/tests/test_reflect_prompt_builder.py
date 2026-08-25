@@ -571,7 +571,7 @@ _FRENCH_DIRECTIVE = {
 }
 
 
-def test_final_prompt_always_includes_language_rule():
+def test_final_prompt_includes_language_rule_when_no_output_language_is_set():
     prompt = build_final_system_prompt()
     assert "The current date and time is 2026-08-09 14:32 UTC." in prompt
     assert "## LANGUAGE" in prompt
@@ -596,9 +596,16 @@ def test_final_prompt_injects_directives_so_answer_obeys_them():
     assert "takes precedence over this default" in prompt
 
 
-def test_final_prompt_output_language_override_is_appended_last():
-    """HINDSIGHT_API_LLM_OUTPUT_LANGUAGE forces a language regardless of query/directive."""
+def test_final_prompt_output_language_override_replaces_the_language_rule():
+    """HINDSIGHT_API_LLM_OUTPUT_LANGUAGE forces a language regardless of query/directive.
+
+    This used to assert the override merely came *after* the default rule, on the theory
+    that appending it last made it win. It did not: the rule is phrased more forcefully
+    and comes first, so the model kept answering in the question's language and the
+    setting was a no-op. The rule is now dropped outright when a language is configured,
+    the same resolution retain and consolidation use (#3776).
+    """
     prompt = build_final_system_prompt(llm_output_language="Spanish")
     assert "Respond exclusively in Spanish" in prompt
-    # The config override is appended after the default LANGUAGE rule so it wins.
-    assert prompt.index("Respond exclusively in Spanish") > prompt.index("## LANGUAGE")
+    assert "## LANGUAGE" not in prompt
+    assert "SAME language as the user's question" not in prompt
