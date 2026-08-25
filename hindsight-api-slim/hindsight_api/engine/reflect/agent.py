@@ -729,6 +729,7 @@ async def _run_reflect_agent_inner(
                 context,
                 max_context_tokens=max_context_tokens,
                 max_tokens=max_tokens,
+                llm_output_language=llm_output_language,
             )
             answer = await _tracked_llm_call(prompt, "final", final_system, synthesis_max_completion_tokens)
         else:
@@ -750,7 +751,14 @@ async def _run_reflect_agent_inner(
                 )
             )
             # Reduce: one synthesis call over every chunk's claims.
-            prompt = build_reduce_prompt(query, list(claim_sections), bank_profile, context, max_tokens=max_tokens)
+            prompt = build_reduce_prompt(
+                query,
+                list(claim_sections),
+                bank_profile,
+                context,
+                max_tokens=max_tokens,
+                llm_output_language=llm_output_language,
+            )
             answer = await _tracked_llm_call(prompt, "final", final_system, synthesis_max_completion_tokens)
 
         if not (answer or "").strip():

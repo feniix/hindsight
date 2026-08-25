@@ -16,7 +16,11 @@ from unittest.mock import MagicMock
 import pytest
 
 from hindsight_api.engine.prompt_utils import output_language_directive
-from hindsight_api.engine.reflect.prompts import build_final_system_prompt
+from hindsight_api.engine.reflect.prompts import (
+    build_final_prompt,
+    build_final_system_prompt,
+    build_reduce_prompt,
+)
 from hindsight_api.engine.retain.fact_extraction import (
     _DEFAULT_LANGUAGE_RULE as _RETAIN_DEFAULT_LANGUAGE_RULE,
 )
@@ -217,16 +221,45 @@ def test_consolidation_directive_does_not_break_format_placeholders():
 def test_reflect_unset_does_not_inject_directive():
     prompt = build_final_system_prompt(mission=None, llm_output_language=None)
     assert "Respond exclusively in" not in prompt
+    assert build_final_prompt("q", [], {"name": "Bank"}) == build_final_prompt(
+        "q", [], {"name": "Bank"}, llm_output_language=None
+    )
 
 
 def test_reflect_injects_directive():
-    prompt = build_final_system_prompt(mission=None, llm_output_language="Korean")
+    """Reflect's directive rides on the USER prompt, not the system prompt.
+
+    It has to be the last thing the model reads: the question and the retrieved data
+    follow the system prompt, and a directive stranded behind them loses (#3776 — see
+    ``build_final_system_prompt`` for the measurement).
+    """
+    prompt = build_final_prompt("질문", [], {"name": "Bank"}, llm_output_language="Korean")
     assert "Respond exclusively in Korean" in prompt
+    assert prompt.rstrip().endswith("must be in Korean."), "the directive must come last"
+
+
+def test_reflect_reduce_prompt_injects_directive():
+    """The split-synthesis path writes the answer too, so it carries the directive as well.
+
+    ``_forced_final_synthesis`` picks between ``build_final_prompt`` and
+    ``build_reduce_prompt`` on whether the retrieved data fits one chunk. A configured
+    output language that only worked below that threshold would be the same silent no-op
+    in a different disguise.
+    """
+    prompt = build_reduce_prompt("질문", ["- a claim"], {"name": "Bank"}, llm_output_language="Korean")
+    assert "Respond exclusively in Korean" in prompt
+    assert prompt.rstrip().endswith("must be in Korean."), "the directive must come last"
+
+
+def test_reflect_unset_does_not_inject_directive_into_the_user_prompt():
+    prompt = build_final_prompt("question", [], {"name": "Bank"}, llm_output_language=None)
+    assert "Respond exclusively in" not in prompt
 
 
 def test_reflect_preserves_mission_alongside_directive():
-    prompt = build_final_system_prompt(mission="Act as a financial analyst.", llm_output_language="Spanish")
-    assert "financial analyst" in prompt
+    system_prompt = build_final_system_prompt(mission="Act as a financial analyst.", llm_output_language="Spanish")
+    prompt = build_final_prompt("q", [], {"name": "Bank"}, llm_output_language="Spanish")
+    assert "financial analyst" in system_prompt
     assert "Respond exclusively in Spanish" in prompt
 
 
@@ -234,15 +267,18 @@ def test_reflect_directive_replaces_source_language_rule():
     """Reflect follows retain and consolidation: an explicit output language drops the
     answer-in-the-question's-language default instead of contradicting it.
 
-    The rule defers to "a directive above", but the output-language directive is appended
-    at the very END of the prompt — so before this it never took precedence, and a
-    configured language was silently no-opped for reflect answers.
+    The rule defers to "a directive above" and nothing ever put one there, so before this
+    it never took precedence and a configured language was silently no-opped. Dropping the
+    rule is only half of it — the directive also has to reach the model *after* the
+    question; ``test_reflect_injects_directive`` pins that half.
     """
     from hindsight_api.engine.reflect.prompts import _FINAL_LANGUAGE_RULE
 
-    prompt = build_final_system_prompt(mission=None, llm_output_language="Korean")
+    system_prompt = build_final_system_prompt(mission=None, llm_output_language="Korean")
+    prompt = build_final_prompt("질문", [], {"name": "Bank"}, llm_output_language="Korean")
 
-    assert _FINAL_LANGUAGE_RULE not in prompt
+    assert _FINAL_LANGUAGE_RULE not in system_prompt
+    assert output_language_directive("Korean") not in system_prompt, "the directive belongs on the user prompt"
     assert output_language_directive("Korean") in prompt
 
 

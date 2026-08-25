@@ -600,12 +600,14 @@ def test_final_prompt_output_language_override_replaces_the_language_rule():
     """HINDSIGHT_API_LLM_OUTPUT_LANGUAGE forces a language regardless of query/directive.
 
     This used to assert the override merely came *after* the default rule, on the theory
-    that appending it last made it win. It did not: the rule is phrased more forcefully
-    and comes first, so the model kept answering in the question's language and the
-    setting was a no-op. The rule is now dropped outright when a language is configured,
-    the same resolution retain and consolidation use (#3776).
+    that appending it last made it win. It did not, twice over. The rule is phrased more
+    forcefully, so it had to be dropped rather than argued with — and even with the rule
+    gone, "last in the system prompt" is not last: the question and the retrieved data
+    arrive after it in the user message and out-rank it (measured 0/12 English on
+    gemini-2.5-flash-lite). So the system prompt now drops the rule and carries no
+    directive at all; ``build_final_prompt`` closes the user message with it (#3776).
     """
     prompt = build_final_system_prompt(llm_output_language="Spanish")
-    assert "Respond exclusively in Spanish" in prompt
     assert "## LANGUAGE" not in prompt
     assert "SAME language as the user's question" not in prompt
+    assert "Respond exclusively in Spanish" not in prompt, "the directive belongs on the user prompt"

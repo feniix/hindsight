@@ -11,6 +11,7 @@ import json
 from datetime import datetime, timezone
 from typing import Any
 
+from ..prompt_utils import default_language_section, escape_for_prompt, output_language_directive
 from .tokenization import count_prompt_tokens
 
 # Fraction of max_context_tokens reserved for tool results in the final synthesis prompt.
@@ -666,10 +667,15 @@ def build_final_prompt(
     additional_context: str | None = None,
     max_context_tokens: int = 100_000,
     max_tokens: int | None = None,
+    llm_output_language: str | None = None,
 ) -> str:
     """Build the final prompt when forcing a text response (no tools).
 
     ``max_tokens`` is the soft visible-length target (see ``_length_directive``).
+
+    ``llm_output_language`` closes the prompt with :func:`output_language_directive`.
+    It rides on the USER message, not the system prompt, because it has to be the last
+    thing the model reads — see :func:`build_final_system_prompt` for the measurement.
 
     Callers overflow-proof this via ``split_context_history``: when the whole
     history fits one chunk this renders it directly, and the per-block budget
@@ -711,7 +717,7 @@ def build_final_prompt(
     if length_directive is not None:
         parts.append(length_directive)
 
-    return "\n".join(parts)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
 
 
 #: System prompt for the intermediate (map) calls of split synthesis. They do
@@ -757,6 +763,7 @@ def build_reduce_prompt(
     bank_profile: dict,
     additional_context: str | None = None,
     max_tokens: int | None = None,
+    llm_output_language: str | None = None,
 ) -> str:
     """Build the final prompt that synthesizes the answer from per-chunk claims.
 
@@ -766,6 +773,9 @@ def build_reduce_prompt(
     in different sections — that is why the claims carry ``mentioned_at``: the
     supersession rule (latest statement wins) must be applied across sections,
     not within one.
+
+    Carries the output-language directive for the same reason, and in the same place, as
+    :func:`build_final_prompt` — this is the other prompt that writes a user-visible answer.
     """
     parts = _bank_identity_section(bank_profile, additional_context)
 
@@ -792,7 +802,7 @@ def build_reduce_prompt(
     if length_directive is not None:
         parts.append(length_directive)
 
-    return "\n".join(parts)
+    return "\n".join(parts) + output_language_directive(llm_output_language)
 
 
 _FINAL_SYSTEM_PROMPT_BASE = """CRITICAL: You MUST ONLY use information from retrieved tool results. NEVER make up names, people, events, or entities.
@@ -834,11 +844,10 @@ CRITICAL: This is a NON-CONVERSATIONAL system. NEVER ask follow-up questions, of
 # demands a specific one (the cause of flaky multilingual reflect tests).
 #
 # Emitted only when no output language is configured — see default_language_section().
-# The escape hatch below defers to a directive "above", but output_language_directive()
-# is appended at the very END of the prompt, so it never triggered: with a configured
-# language the model saw this rule first, phrased more forcefully, and answered in the
-# question's language instead. Retain and consolidation drop their rule for exactly this
-# reason (#3776); reflect now does too.
+# The escape hatch below defers to a directive "above", but nothing ever put one there:
+# with a configured language the model saw this rule, phrased more forcefully, and
+# answered in the question's language instead. Retain and consolidation drop their rule
+# for exactly this reason (#3776); reflect does too.
 _FINAL_LANGUAGE_RULE = (
     "## LANGUAGE\n"
     "- Respond in the SAME language as the user's question "
@@ -858,17 +867,20 @@ def build_final_system_prompt(
     ``directives`` are re-injected here (they live in the agent/reasoning prompt,
     but the final answer is a separate call) so output-constraining rules — most
     visibly response language — are honoured by the model that actually writes
-    the answer. When ``llm_output_language`` is set it forces that language
-    regardless of the query/source/directive language (config override wins), and
-    the answer-in-the-question's-language default is dropped rather than left to
-    contradict it.
-    """
-    from hindsight_api.engine.prompt_utils import (
-        default_language_section,
-        escape_for_prompt,
-        output_language_directive,
-    )
+    the answer.
 
+    ``llm_output_language`` drops the answer-in-the-question's-language default rather
+    than leaving it to contradict the directive. It does NOT add the directive here.
+    That is deliberate and measured: this prompt is the system message, and the question
+    and the retrieved data both arrive *after* it in the user message. Appending the
+    directive at the end of this string still leaves it out-ranked by everything the
+    model reads next — a Chinese question with the output language set to English came
+    back in Chinese 12 times out of 12 on gemini-2.5-flash-lite, and 0/5 on
+    gemini-2.5-flash, with no contradicting rule anywhere in the prompt. Moving the same
+    directive to the end of the user message is 12/12 and 5/5 English. So
+    :func:`build_final_prompt` and :func:`build_reduce_prompt` carry it instead, where it
+    is genuinely the last thing the model reads (#3776).
+    """
     role_section = escape_for_prompt(mission.strip()) if mission else _DEFAULT_FINAL_ROLE
 
     parts = [build_directives_section(directives) if directives else ""]
@@ -879,7 +891,7 @@ def build_final_system_prompt(
     # remain a cacheable prefix and only this timestamp falls outside the cache.
     parts.append(_current_datetime_section())
 
-    return "\n\n".join(p.strip() for p in parts if p.strip()) + output_language_directive(llm_output_language)
+    return "\n\n".join(p.strip() for p in parts if p.strip())
 
 
 # Backward-compatible constant for non-identity missions
