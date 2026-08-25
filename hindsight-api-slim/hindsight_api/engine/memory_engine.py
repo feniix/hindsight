@@ -14,7 +14,6 @@ import contextvars
 import copy
 import difflib
 import functools
-import hashlib
 import inspect
 import json
 import logging
@@ -874,34 +873,14 @@ def _screen_document_body(body: str, config: HindsightConfig) -> ScreenedDocumen
 
     The hash is of the REDACTED text, because that is what gets written — a hash taken
     before redaction would describe a document that was never stored, and every ownership
-    check against it would miss. Callers cache by body; this does no caching of its own.
+    check against it would miss. Callers cache the last body by identity; this does no
+    caching of its own.
     """
-    from .retain.fact_extraction import _sanitize_text
+    from .retain.fact_extraction import derive_document_content_hash
     from .retain.orchestrator import redact_document_body
 
     redacted = redact_document_body(body, config)
-    sanitized = _sanitize_text(redacted) or ""
-    return ScreenedDocumentBody(text=redacted, content_hash=_sha256_windowed(sanitized))
-
-
-# How much text is encoded to bytes at a time when hashing a document body. Slicing a str
-# by character index never splits a character, so the concatenated windows are byte-identical
-# to encoding the whole string — this only changes how much of it exists at once.
-_HASH_WINDOW_CHARS = 1024 * 1024
-
-
-def _sha256_windowed(text: str) -> str:
-    """``sha256`` of ``text``'s UTF-8 bytes, without materialising them all.
-
-    ``text.encode()`` on a document body allocates a second full copy of it purely to feed
-    the hash — 45 MB for a 45 MB document, the last allocation in the retain front half that
-    still scaled with the input (#3756). Feeding the digest a megabyte at a time gives the
-    same hex digest at a bounded cost.
-    """
-    digest = hashlib.sha256()
-    for start in range(0, len(text), _HASH_WINDOW_CHARS):
-        digest.update(text[start : start + _HASH_WINDOW_CHARS].encode())
-    return digest.hexdigest()
+    return ScreenedDocumentBody(text=redacted, content_hash=derive_document_content_hash(redacted))
 
 
 @dataclass
@@ -915,6 +894,10 @@ class _RawSubBatch:
 
     contents: list[RetainContentDict]
     origins: list[int]
+    # Every slice cut from one oversized item carries the *same* string object here, and
+    # those slices are yielded consecutively. :func:`iter_sub_batches` screens each document
+    # once by relying on both: rebuilding this string per slice would silently turn its
+    # cache into a permanent miss (a full redaction + hash per slice, #3756).
     body_override: str | None
     chunk_count: int
 
@@ -1022,16 +1005,24 @@ def iter_sub_batches(
     #3282), and ``is_last``, from a one-item lookahead.
     """
     # A one-entry cache, not a dict keyed by body: every slice of an oversized item is
-    # yielded consecutively and carries the *same string object*, so identity is enough to
-    # hit — and with Memory Defense redaction on, a screened body is a full second copy of
-    # the document. Keeping a dict would hold one such copy per document in the submission
-    # for the whole retain, which is the cost this streaming path exists to remove (#3756).
+    # yielded consecutively and carries the *same string object* (see
+    # ``_RawSubBatch.body_override``), so identity is enough to hit — and with Memory
+    # Defense redaction on, a screened body is a full second copy of the document. Keeping a
+    # dict would hold one such copy per document in the submission for the whole retain,
+    # which is the cost this streaming path exists to remove (#3756). The trade is that two
+    # separate items with equal bodies screen twice where the dict screened once; that costs
+    # one redaction, where the dict cost a retained copy of every body.
     last_body: str | None = None
     last_screened: ScreenedDocumentBody | None = None
 
     def _screen(body: str | None) -> ScreenedDocumentBody | None:
         nonlocal last_body, last_screened
         if body is None:
+            # A sub-batch that is not a slice ends the run for the previous document, so
+            # drop the entry rather than pin its screened copy for the rest of the
+            # submission — up to ~45 MB held for no reason. Slices of one document are
+            # always consecutive, so this can never evict an entry a later slice would hit.
+            last_body, last_screened = None, None
             return None
         if body is not last_body:
             last_body, last_screened = body, _screen_document_body(body, config)
