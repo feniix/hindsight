@@ -308,6 +308,7 @@ function piFamilyInstaller(
       c.log?.(`${harness}: extension registered in ${path}`);
     },
     uninstall(c) {
+      // Before the settings guard on purpose: a hand-deleted settings.json must not strand the skill.
       uninstallSkill(c, skills(c));
       const path = settings(c);
       if (!existsSync(path)) return;
