@@ -1,12 +1,13 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { claudeProjectDir, importLocalHistory } from "./history";
 
 let home: string;
 afterEach(() => {
   if (home) rmSync(home, { recursive: true, force: true });
+  vi.unstubAllEnvs();
 });
 
 function newHome(): string {
@@ -125,6 +126,41 @@ describe("local history import", () => {
     const r = importLocalHistory("codex", "/repo/mine", h);
     expect(r.sessions).toHaveLength(1);
     expect(JSON.stringify(r.sessions)).toContain("found me");
+  });
+
+  // Regression: dshHistory guarded its root with existsSync — true for a regular file — and then
+  // called readdirSync on it unguarded, so a stray file at ~/.dsh/sessions threw ENOTDIR out of
+  // importLocalHistory, which documents that it never throws, and whose caller does not catch.
+  it("treats a regular file at the dsh sessions root as no sessions, not a crash", () => {
+    const h = newHome();
+    // The reader prefers $DSH_HOME over the home it is handed; a developer who runs dsh would
+    // otherwise have this test read their real sessions.
+    vi.stubEnv("DSH_HOME", join(h, ".dsh"));
+    mkdirSync(join(h, ".dsh"), { recursive: true });
+    writeFileSync(join(h, ".dsh", "sessions"), "not a folder");
+
+    const r = importLocalHistory("dsh", "/Users/x/dev/myrepo", h);
+    expect(r.supported).toBe(true);
+    expect(r.sessions).toEqual([]);
+  });
+
+  it("reads dsh sessions past a stray file where a project directory was expected", () => {
+    const h = newHome();
+    const repo = "/Users/x/dev/myrepo";
+    vi.stubEnv("DSH_HOME", join(h, ".dsh"));
+    const root = join(h, ".dsh", "sessions");
+    mkdirSync(join(root, "myrepo", "s1"), { recursive: true });
+    writeFileSync(
+      join(root, "myrepo", "s1", "session.jsonl"),
+      `${JSON.stringify({ id: "s1", cwd: repo })}\n` +
+        `${JSON.stringify({ type: "user/message", time: Date.parse("2026-08-14T10:00:00Z"), data: { role: "user", content: [{ type: "text", text: "real work" }], source: { kind: "user" } } })}\n`
+    );
+    writeFileSync(join(root, "stray"), "not a folder");
+
+    const r = importLocalHistory("dsh", repo, h);
+    expect(r.supported).toBe(true);
+    expect(r.sessions).toHaveLength(1);
+    expect(JSON.stringify(r.sessions)).toContain("real work");
   });
 
   it("reports SQLite-backed harnesses as unsupported with a reason, not an empty success", () => {

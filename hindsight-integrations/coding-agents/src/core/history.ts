@@ -234,7 +234,10 @@ function dshHistory(repoDir: string, home: string): HistoryImport {
   const root = process.env.DSH_HOME
     ? join(process.env.DSH_HOME, "sessions")
     : join(home, ".dsh", "sessions");
-  if (!existsSync(root)) return { supported: true, sessions: [] };
+  // listDir, not existsSync: a regular file at the sessions root passes existsSync and then makes
+  // readdirSync throw ENOTDIR out of importLocalHistory, which promises never to throw.
+  const projectDirs = listDir(root).map((project) => join(root, project));
+  if (projectDirs.length === 0) return { supported: true, sessions: [] };
   if (typeof zlib.zstdDecompressSync !== "function") {
     return {
       supported: false,
@@ -246,14 +249,8 @@ function dshHistory(repoDir: string, home: string): HistoryImport {
   }
   const sessions: ChatSession[] = [];
   let unattributed = 0;
-  for (const dir of readdirSync(root).map((project) => join(root, project))) {
-    let sessionDirs: string[];
-    try {
-      sessionDirs = readdirSync(dir).map((id) => join(dir, id));
-    } catch {
-      continue; // a stray file where a project directory was expected
-    }
-    for (const sessionDir of sessionDirs) {
+  for (const dir of projectDirs) {
+    for (const sessionDir of listDir(dir).map((id) => join(dir, id))) {
       const file = ["session.jsonl.zstd", "session.jsonl"]
         .map((name) => join(sessionDir, name))
         .find((candidate) => existsSync(candidate));
