@@ -325,6 +325,11 @@ class TestReflectAgentMocked:
             assert messages[1]["role"] == "user"
             assert messages[1]["content"].startswith("张伟负责什么工作？")
             assert "Respond exclusively in English" in messages[1]["content"]
+            # The done tool schema is the last thing the model reads before writing the
+            # answer; its own "SAME language" rule has to go too, or it wins from there.
+            done_tool = next(t for t in call.kwargs["tools"] if t["function"]["name"] == "done")
+            assert "SAME language" not in done_tool["function"]["parameters"]["properties"]["answer"]["description"]
+            assert "exclusively in English" in done_tool["function"]["description"]
 
     @pytest.mark.asyncio
     async def test_done_tool_answer_respects_max_tokens(self, mock_llm, mock_functions):

@@ -523,6 +523,7 @@ async def _run_reflect_agent_inner(
         include_recall=include_recall,
         include_expand=include_expand,
         answer_as_document=answer_as_document,
+        llm_output_language=llm_output_language,
     )
     # Build set of enabled tool names to guard against LLM hallucinating disabled tool calls
     enabled_tools: frozenset[str] = frozenset(t["function"]["name"] for t in tools if t.get("type") == "function")

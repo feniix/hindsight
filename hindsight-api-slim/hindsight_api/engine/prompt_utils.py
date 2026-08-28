@@ -53,9 +53,11 @@ def default_language_section(default_rule: str, language: str | None) -> str:
     explicit language drops the rule outright rather than arguing with it.
 
     ``default_rule`` is the pipeline's own wording (retain, consolidation and reflect each
-    say it differently); only the selection is shared. All three call this — nothing may
-    append a source-language rule of its own, or it reintroduces exactly the contradiction
-    this exists to remove. Returns the rule followed by a blank line, ready to prepend to a
+    say it differently); only the selection is shared. Every prompt that carries such a rule
+    calls this — retain, consolidation, and both of reflect's system prompts — and reflect's
+    ``done`` tool schema applies the same exclusion by hand. Nothing may append a
+    source-language rule of its own, or it reintroduces exactly the contradiction this
+    exists to remove. Returns the rule followed by a blank line, ready to prepend to a
     prompt body, or ``""`` when ``language`` is set.
     """
     return "" if language else f"{default_rule}\n\n"
