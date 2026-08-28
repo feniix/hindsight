@@ -2470,6 +2470,8 @@ class MemoryEngine(MemoryEngineInterface):
                 "facts_imported": result.facts_imported,
                 "observations_imported": result.observations_imported,
                 "observations_skipped": result.observations_skipped,
+                "mental_models_imported": result.mental_models_imported,
+                "knowledge_pages_imported": result.knowledge_pages_imported,
                 "skipped_document_ids": result.skipped_document_ids,
                 "remapped_document_ids": result.remapped_document_ids,
             }
@@ -2504,6 +2506,7 @@ class MemoryEngine(MemoryEngineInterface):
         operation_id = task_dict.get("operation_id")
         document_ids = task_dict.get("document_ids")
         include_observations = task_dict.get("include_observations", False)
+        include_knowledge_base = task_dict.get("include_knowledge_base", False)
         if not bank_id:
             raise ValueError("bank_id is required for export_documents task")
 
@@ -2518,7 +2521,11 @@ class MemoryEngine(MemoryEngineInterface):
         )
 
         archive_bytes = await self.export_documents_async(
-            bank_id, context, document_ids, include_observations=include_observations
+            bank_id,
+            context,
+            document_ids,
+            include_observations=include_observations,
+            include_knowledge_base=include_knowledge_base,
         )
 
         # A fresh uuid per export keeps concurrent/repeat exports of the same bank
@@ -5788,6 +5795,7 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
         document_ids: list[str] | None = None,
         include_observations: bool = False,
+        include_knowledge_base: bool = False,
     ) -> bytes:
         """Export documents from a bank into a transfer ZIP archive (no LLM, no embeddings).
 
@@ -5809,6 +5817,7 @@ class MemoryEngine(MemoryEngineInterface):
             bank_id,
             document_ids,
             include_observations=include_observations,
+            include_knowledge_base=include_knowledge_base,
             memories=get_memories(),
         )
 
@@ -5818,6 +5827,7 @@ class MemoryEngine(MemoryEngineInterface):
         request_context: "RequestContext",
         document_ids: list[str] | None = None,
         include_observations: bool = False,
+        include_knowledge_base: bool = False,
     ) -> dict[str, Any]:
         """Submit an async document-export operation and return its ``operation_id``.
 
@@ -5831,8 +5841,10 @@ class MemoryEngine(MemoryEngineInterface):
         """
         # Reject the incoherent combination up front — same guard export_documents
         # raises — so the caller gets an immediate 400 rather than a failed task.
-        if include_observations and document_ids is not None:
-            raise ValueError("include_observations is only supported when exporting the whole bank (omit document_id)")
+        if (include_observations or include_knowledge_base) and document_ids is not None:
+            raise ValueError(
+                "include_observations and include_knowledge_base are only supported when exporting the whole bank (omit document_id)"
+            )
 
         await self._authenticate_tenant(request_context)
         await self._get_backend()
@@ -5840,6 +5852,7 @@ class MemoryEngine(MemoryEngineInterface):
         task_payload: dict[str, Any] = {
             "document_ids": list(document_ids) if document_ids else None,
             "include_observations": include_observations,
+            "include_knowledge_base": include_knowledge_base,
         }
         if request_context.tenant_id:
             task_payload["_tenant_id"] = request_context.tenant_id
@@ -6275,6 +6288,7 @@ class MemoryEngine(MemoryEngineInterface):
 
         # Recall pipeline stages, resolved per bank. A bank can switch off arms its
         # content cannot use, trading recall breadth for latency.
+        enable_text_search = bool(budget_config_dict.get("enable_text_search", True))
         enable_temporal_retrieval = bool(budget_config_dict.get("enable_temporal_retrieval", True))
         enable_graph_retrieval = bool(budget_config_dict.get("enable_graph_retrieval", True))
         reranking = _resolve_reranking(budget_config_dict, reranking)
@@ -6337,6 +6351,7 @@ class MemoryEngine(MemoryEngineInterface):
                             max_source_facts_tokens_per_observation=max_source_facts_tokens_per_observation,
                             reranking=reranking,
                             reranker_max_candidates=reranker_max_candidates,
+                            enable_text_search=enable_text_search,
                             enable_temporal_retrieval=enable_temporal_retrieval,
                             enable_graph_retrieval=enable_graph_retrieval,
                         )
@@ -6479,6 +6494,7 @@ class MemoryEngine(MemoryEngineInterface):
         max_source_facts_tokens_per_observation: int = -1,
         reranking: RecallReranking = "cross_encoder",
         reranker_max_candidates: int | None = None,
+        enable_text_search: bool = True,
         enable_temporal_retrieval: bool = True,
         enable_graph_retrieval: bool = True,
     ) -> RecallResultModel:
@@ -6617,6 +6633,7 @@ class MemoryEngine(MemoryEngineInterface):
                         min_semantic=min_scores.semantic if min_scores else None,
                         min_keyword=min_scores.keyword if min_scores else None,
                         temporal_window=temporal_window,
+                        enable_text_search=enable_text_search,
                         enable_temporal_retrieval=enable_temporal_retrieval,
                         enable_graph_retrieval=enable_graph_retrieval,
                     )
@@ -6770,15 +6787,19 @@ class MemoryEngine(MemoryEngineInterface):
                         fact_type=ft_name,
                     )
 
-                    # Add BM25 retrieval results for this fact type
-                    tracer.add_retrieval_results(
-                        method_name="bm25",
-                        results=to_tuple_format(rr.bm25),
-                        duration_seconds=rr.timings.get("bm25", 0.0),
-                        score_field="bm25_score",
-                        metadata={"limit": thinking_budget},
-                        fact_type=ft_name,
-                    )
+                    # Add BM25 retrieval results for this fact type, unless the bank has
+                    # text search off — then the arm was never in the SQL, and recording
+                    # an empty entry would read as "ran, matched nothing" rather than
+                    # "absent". Same reasoning as the graph guard below.
+                    if enable_text_search:
+                        tracer.add_retrieval_results(
+                            method_name="bm25",
+                            results=to_tuple_format(rr.bm25),
+                            duration_seconds=rr.timings.get("bm25", 0.0),
+                            score_field="bm25_score",
+                            metadata={"limit": thinking_budget},
+                            fact_type=ft_name,
+                        )
 
                     # Add graph retrieval results for this fact type.
                     # Skipped entirely when the arm is off: an empty graph entry is
@@ -15883,7 +15904,8 @@ class MemoryEngine(MemoryEngineInterface):
         The BM25 arm is dispatched on the configured text-search backend
         (:func:`knowledge_bm25_arm`); backends whose ``mental_models`` BM25 index
         is unpopulated (``vchord``) degrade to a vector-only search rather than
-        erroring.
+        erroring. ``enable_text_search=false`` drops that arm outright, leaving a
+        vector-only ranking.
         """
         await self._authenticate_tenant(request_context)
         if self._operation_validator and not _nested_operation_authorized.get():
@@ -15915,10 +15937,31 @@ class MemoryEngine(MemoryEngineInterface):
         # BM25 clauses for the configured text-search backend (same per-backend
         # dispatch the memory-recall BM25 arm uses — see knowledge_bm25_arm).
         text_search_extension = get_config().text_search_extension
+        # enable_text_search is per bank, so it is resolved rather than read off the
+        # global config: a bank that switched the keyword arm off in recall must not
+        # keep hitting a text index here. Costs one config round trip, the same one
+        # recall already pays. With no embedding either there is no arm left to run,
+        # so the search has no answer to give rather than a degraded one.
+        bank_config = await self._config_resolver.get_bank_config(bank_id, request_context)
+        enable_text_search = bool(bank_config.get("enable_text_search", True))
+        if not enable_text_search and emb_str is None:
+            return []
 
         backend = await self._get_backend()
         async with acquire_with_retry(backend) as conn:
-            if emb_str is not None:
+            if emb_str is not None and not enable_text_search:
+                # Vector-only: no BM25 arm to fuse with, so rank straight off the ANN scan.
+                sql = f"""
+                    SELECT kp.id, kp.name, kp.mental_model_id,
+                           LEFT(mm.content, 280) AS snippet, mm.last_refreshed_at AS updated_at,
+                           1.0 / (60 + ROW_NUMBER() OVER (ORDER BY mm.embedding <=> $1::vector)) AS score
+                    FROM {join}
+                    WHERE kp.bank_id = $2 AND kp.kind = 'page' AND mm.embedding IS NOT NULL
+                    ORDER BY mm.embedding <=> $1::vector
+                    LIMIT {limit}
+                """
+                rows = await conn.fetch(sql, emb_str, bank_id)
+            elif emb_str is not None:
                 bm25 = knowledge_bm25_arm(text_search_extension, table_alias="mm", text_param="$3")
                 # Vector arm (ANN over mm.embedding) + BM25 arm, each ranked
                 # independently, then RRF-fused (k=60) in SQL.

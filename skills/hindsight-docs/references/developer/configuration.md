@@ -25,6 +25,7 @@ The API service handles all memory operations (retain, recall, reflect).
 | `HINDSIGHT_API_DATABASE_SCHEMA` | PostgreSQL schema name for tables | `public` |
 | `HINDSIGHT_API_RUN_MIGRATIONS_ON_STARTUP` | Run database migrations on API startup | `true` |
 | `HINDSIGHT_API_MIGRATION_CONCURRENCY` | Number of tenant schemas to migrate concurrently (PostgreSQL only). Each schema runs in its own process; within a schema migrations are always sequential. Each worker has a fixed startup cost (~1–2s to boot a fresh interpreter), so this only pays off with **many** schemas (roughly tens or more) or slow/high-latency migrations — for a handful of schemas it is slower than sequential. Each worker uses ~3 database connections, so keep `concurrency × 3` within your database's spare `max_connections` (and any PgBouncer pool limit). `1` = fully sequential. Measured at 20k schemas: the per-restart no-op resweep dropped from ~60min to ~11min (≈5×) at `concurrency=12`. | `1` |
+| `HINDSIGHT_API_EXTERNALLY_OWNED_ROUTINES` | Comma-separated list of maintenance discovery routines this deployment installs itself (see [Owning a maintenance routine](#owning-a-maintenance-routine)). Migrations skip anything named here. | Empty (every routine installed) |
 | `HINDSIGHT_API_DATABASE_BACKEND` | Database engine backend: `postgresql` or `oracle` (Oracle 23ai) | `postgresql` |
 
 If not provided, the server uses embedded `pg0` — convenient for development but not recommended for production.
@@ -43,6 +44,42 @@ export HINDSIGHT_API_DATABASE_SCHEMA=hindsight
 ```
 
 Migrations will automatically create the schema if it doesn't exist and create all tables in the configured schema.
+
+#### Owning a maintenance routine
+
+The background maintenance loop finds work by calling four PostgreSQL routines —
+`mental_models_with_cron`, `banks_needing_consolidation`, `schemas_with_expired_rows` and
+`schemas_with_expired_operations`. The stock implementations scan every schema in the
+database on each tick. On a large multi-tenant install that is a serial loop over
+thousands of schemas, repeated once per tick in every process running the loop.
+
+Because they are called by name, you can replace one with an implementation suited to
+your installation — typically a registry table maintained by a row trigger, so discovery
+costs one indexed read instead of a scan. List the ones you have replaced and migrations
+will leave them alone:
+
+```bash
+export HINDSIGHT_API_EXTERNALLY_OWNED_ROUTINES=mental_models_with_cron,banks_needing_consolidation
+```
+
+Read from the environment of whatever process runs the migration, so it applies equally to
+`hindsight-admin run-db-migration`, a migration Job, and migrate-on-startup.
+
+Without this, your replacement survives only until the next migration that reinstalls the
+routine: they are all `CREATE OR REPLACE` against the same name, so the migration wins and
+nothing records that a custom implementation was discarded.
+
+A few things to know:
+
+- **Your replacement must match the stock signature.** The loop calls these with fixed
+  arguments and reads fixed columns back.
+- **Nothing verifies that a replacement exists.** Naming a routine you have not installed
+  leaves whatever was there before — nothing, on a fresh database — and the maintenance
+  loop then fails on the missing function rather than quietly running the scan you were
+  trying to avoid.
+- **Ownership is not stamped into the database.** Remove a name from the list and the next
+  migration reinstalls the stock routine, with no data fix-up.
+- **Empty by default.** An installation that has not replaced anything is unaffected.
 
 ### Database Connection Pool
 
@@ -214,6 +251,10 @@ Hindsight supports five backends for BM25 keyword retrieval:
 - **pg_textsearch** — Timescale's pg_textsearch extension. English-only.
 - **pgroonga** — pgroonga full-text search. Multilingual / CJK out of the box.
 - **pg_search** — ParadeDB pg_search. True BM25; the only backend that is Citus-compatible.
+
+A bank can also use none of them: [`enable_text_search`](#recall-pipeline-stages)
+switches the keyword arm off per bank, leaving pure vector search. Every setting in
+this table is then unused by that bank.
 
 To switch backends: set `HINDSIGHT_API_TEXT_SEARCH_EXTENSION`. With existing data, you'll get an error and migration instructions; with an empty database the columns/indexes are recreated automatically on startup.
 
@@ -1344,16 +1385,21 @@ ingested with `retain_extraction_mode: chunks` and used as plain retrieval.
 
 These switch the individual stages off. All are hierarchical — overridable per bank via the
 [config API](#hierarchical-configuration) — so one bank can run lean without changing how the
-rest of the deployment recalls. Semantic and BM25 always run; they are the baseline retrieval.
+rest of the deployment recalls. Semantic always runs; it is the baseline retrieval.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `HINDSIGHT_API_ENABLE_TEXT_SEARCH` | Run the keyword (BM25) retrieval arm. `false` leaves **pure vector search** — the arm is left out of the query entirely rather than filtered to nothing, so its SQL, its query tokenization and its `pg_stats` term-selection lookup are all skipped. Also drops the keyword arm from knowledge-page search. | `true` |
 | `HINDSIGHT_API_ENABLE_TEMPORAL_RETRIEVAL` | Run the temporal retrieval arm. `false` also skips the date-aware query analysis that feeds it — without a detected constraint there is nothing to filter on. | `true` |
 | `HINDSIGHT_API_ENABLE_GRAPH_RETRIEVAL` | Run the entity/link graph traversal arm. `false` skips those queries and returns no graph results. | `true` |
 | `HINDSIGHT_API_ENABLE_RERANKING` | Rerank fused candidates with the cross-encoder. `false` returns the RRF-fused ordering directly — faster, but less precise. | `true` |
 
-Turning all three off leaves semantic + BM25 fused by RRF, which is the lowest-latency
-recall configuration.
+Turning all four off reduces recall to a single vector query, which is the
+lowest-latency configuration there is.
+
+Disabling text search leaves the write path alone: `search_vector` and its index are
+still maintained, so a bank can be switched back without a reindex. The
+[text-search backend](#text-search-extension) it would have used is simply unread.
 
 ##### Pairing with the retain side: plain-retrieval ("RAG") banks
 

@@ -4937,7 +4937,7 @@
           "Document Transfer"
         ],
         "summary": "Export documents (async)",
-        "description": "Submit an async export of a bank's documents (extracted facts, entity names, causal links, chunks) as a transfer ZIP archive. Embeddings and database ids are not included \u2014 importing re-embeds with the target bank's model and re-resolves entities. Runs as a background operation to avoid pinning the API on large banks. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id}. On completion the operation's result_metadata carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, and filename. Pass document_id query params to export specific documents, or omit to export the whole bank; include_observations=true also carries consolidated observations (whole-bank export only).",
+        "description": "Submit an async export of a bank's documents (extracted facts, entity names, causal links, chunks) as a transfer ZIP archive. Embeddings and database ids are not included \u2014 importing re-embeds with the target bank's model and re-resolves entities. Runs as a background operation to avoid pinning the API on large banks. Returns an operation_id; poll GET /v1/default/banks/{bank_id}/operations/{operation_id}. On completion the operation's result_metadata carries download_url (fetch the ZIP from GET /v1/default/files/download/{key}), storage_key, byte_size, and filename. Pass document_id query params to export specific documents, or omit to export the whole bank; include_observations=true carries consolidated observations and include_knowledge_base=true carries Mental Models plus Knowledge Pages (all whole-bank export only).",
         "operationId": "export_documents",
         "parameters": [
           {
@@ -4981,6 +4981,18 @@
               "title": "Include Observations"
             },
             "description": "Also export consolidated observations (restored on import; whole-bank only)"
+          },
+          {
+            "name": "include_knowledge_base",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "description": "Also export Mental Models and Knowledge Pages (restored on import; whole-bank only)",
+              "default": false,
+              "title": "Include Knowledge Base"
+            },
+            "description": "Also export Mental Models and Knowledge Pages (restored on import; whole-bank only)"
           },
           {
             "name": "authorization",
@@ -7639,6 +7651,18 @@
             "title": "Observations Mission",
             "description": "Controls what gets synthesised"
           },
+          "enable_text_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Text Search",
+            "description": "Toggle the keyword (BM25) arm during recall, leaving pure vector search"
+          },
           "enable_temporal_retrieval": {
             "anyOf": [
               {
@@ -8834,6 +8858,18 @@
             ],
             "title": "Observations Mission",
             "description": "Controls what gets synthesised into observations. Replaces built-in consolidation rules entirely."
+          },
+          "enable_text_search": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Enable Text Search",
+            "description": "Toggle the keyword (BM25) retrieval arm during recall. Disabling leaves pure vector search: the arm is left out of the query entirely rather than filtered to nothing, so none of its cost is paid. Also drops the keyword arm from knowledge-page search."
           },
           "enable_temporal_retrieval": {
             "anyOf": [
