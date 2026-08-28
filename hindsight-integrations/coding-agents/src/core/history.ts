@@ -351,15 +351,11 @@ function piHistory(repoDir: string, home: string): HistoryImport {
   const exact = piSessionDir(repoDir);
   const nested = `${exact.slice(0, -2)}-`;
   const files: string[] = [];
-  for (const dir of readdirSync(root).filter((d) => d === exact || d.startsWith(nested))) {
-    try {
-      files.push(...jsonlFiles(join(root, dir)));
-    } catch {
-      // A stray FILE named like a session folder: existsSync accepts it and readdirSync then throws
-      // ENOTDIR. That must cost this one entry, not the run — importLocalHistory promises never to
-      // throw and its caller (installer.ts importConversations) has no catch of its own, so the
-      // whole --import-conversations would die on one junk file. Same guard dshHistory applies.
-    }
+  // listDir at both levels: a stray FILE where either `sessions` itself or one of its session
+  // folders was expected must cost that one entry, not the run — importLocalHistory promises never
+  // to throw and its caller (installer.ts importConversations) has no catch of its own.
+  for (const dir of listDir(root).filter((d) => d === exact || d.startsWith(nested))) {
+    files.push(...jsonlFiles(join(root, dir)));
   }
   return piFamilySessions(files, repoDir);
 }

@@ -309,9 +309,23 @@ describe("pi-family history import", () => {
     );
   });
 
-  // Regression: the prefilter hands each matching NAME to readdirSync, so a regular file named like
-  // a session folder threw ENOTDIR out of importLocalHistory — which documents that it never throws,
+  // Regression: `~/.pi/agent/sessions` itself as a regular file passed the existsSync check and the
+  // root readdirSync threw ENOTDIR out of importLocalHistory — which documents that it never throws,
   // and whose caller does not catch. One junk file killed the whole --import-conversations run.
+  it("treats a stray file where the pi sessions ROOT was expected as no history", () => {
+    const h = newHome();
+    mkdirSync(join(h, ".pi", "agent"), { recursive: true });
+    writeFileSync(join(h, ".pi", "agent", "sessions"), "not a folder");
+
+    expect(importLocalHistory("pi", "/Users/x/dev/myrepo", h)).toEqual({
+      supported: true,
+      sessions: [],
+      unattributed: 0,
+    });
+  });
+
+  // Same shape one level down: a regular file named like a session folder must cost that one
+  // entry, not the run.
   it("skips a stray file where a pi session folder was expected, keeping the real sessions", () => {
     const h = newHome();
     const repo = "/Users/x/dev/myrepo";
