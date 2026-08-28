@@ -109,6 +109,35 @@ def build_directives_reminder(directives: list[dict[str, Any]]) -> str:
     return "\n".join(parts)
 
 
+# The reasoning-loop language rule. Emitted only when no output language is configured
+# — see default_language_section(). Like _FINAL_LANGUAGE_RULE it defers to a directive
+# "above", and nothing ever put one there for a configured language: the rule stayed,
+# out-ranked the directive, and the done() answer came back in the question's language
+# on every run that never fell through to forced synthesis (#3776, review).
+_TOOLS_LANGUAGE_RULE = (
+    "## LANGUAGE RULE (default - directives take precedence)\n"
+    "- By default, detect the language of the user's question and respond in that SAME language.\n"
+    "- If the question is in Chinese, respond in Chinese. If in Japanese, respond in Japanese.\n"
+    "- IMPORTANT: The DIRECTIVES section above has HIGHER PRIORITY than this rule.\n"
+    "  If a directive specifies a language (e.g. 'Always respond in French'), follow the directive."
+)
+
+
+def build_agent_user_prompt(query: str, llm_output_language: str | None = None) -> str:
+    """The reasoning loop's opening user message: the question, closed by the directive.
+
+    The ``done()`` answer is written by the tool-calling model, whose system prompt is
+    :func:`build_system_prompt_for_tools`. For the same reason :func:`build_final_prompt`
+    carries the directive instead of :func:`build_final_system_prompt`, it goes on the user
+    message here rather than at the end of the system prompt: the question arrives after
+    the system prompt and out-ranks it. Tool results still follow over later turns, so
+    this is "last" for the question the model is answering, not for the whole
+    conversation — the system prompt dropping its contradicting rule is what makes the
+    directive uncontested (#3776).
+    """
+    return query + output_language_directive(llm_output_language)
+
+
 def build_system_prompt_for_tools(
     bank_profile: dict[str, Any],
     context: str | None = None,
@@ -117,6 +146,7 @@ def build_system_prompt_for_tools(
     include_observations: bool = True,
     budget: str | None = None,
     answer_as_document: bool = False,
+    llm_output_language: str | None = None,
 ) -> str:
     """
     Build the system prompt for tool-calling reflect agent.
@@ -138,6 +168,9 @@ def build_system_prompt_for_tools(
         has_mental_models: Whether the bank has any mental models (skip if not)
         include_observations: Whether search_observations is in the tool list.
         budget: Search depth budget - "low", "mid", or "high". Controls exploration thoroughness.
+        answer_as_document: Whether done() takes a structured document instead of markdown.
+        llm_output_language: Configured output language; drops the default language rule
+            (the directive itself goes on the user message, see build_agent_user_prompt).
     """
     name = bank_profile.get("name", "Assistant")
     mission = bank_profile.get("mission", "")
@@ -165,14 +198,15 @@ def build_system_prompt_for_tools(
         ]
     )
 
+    # Mutually exclusive with the configured output language — the rule is dropped
+    # outright rather than left to out-rank the directive (#3776). The directive itself
+    # is not appended here: it rides on the user message, see build_agent_user_prompt().
+    tools_language_section = default_language_section(_TOOLS_LANGUAGE_RULE, llm_output_language)
+    if tools_language_section:
+        parts.extend([tools_language_section.rstrip("\n"), ""])
+
     parts.extend(
         [
-            "## LANGUAGE RULE (default - directives take precedence)",
-            "- By default, detect the language of the user's question and respond in that SAME language.",
-            "- If the question is in Chinese, respond in Chinese. If in Japanese, respond in Japanese.",
-            "- IMPORTANT: The DIRECTIVES section above has HIGHER PRIORITY than this rule.",
-            "  If a directive specifies a language (e.g. 'Always respond in French'), follow the directive.",
-            "",
             "## CRITICAL RULES",
             "- ONLY use information from tool results - no external knowledge or guessing",
             "- You SHOULD synthesize, infer, and reason from the retrieved memories",

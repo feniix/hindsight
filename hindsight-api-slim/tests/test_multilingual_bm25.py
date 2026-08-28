@@ -293,6 +293,42 @@ def test_reflect_unset_requires_source_language():
     assert "Respond exclusively in" not in prompt
 
 
+def test_reflect_agent_loop_directive_replaces_source_language_rule():
+    """The done() path — not just forced synthesis — honours the configured language.
+
+    Most reflect answers are written by the tool-calling model under
+    ``build_system_prompt_for_tools``; ``build_final_system_prompt`` only reaches the
+    model on the forced-synthesis fallback. Fixing the latter alone left a Chinese
+    question answered in Chinese on every run that completed normally.
+    """
+    from hindsight_api.engine.reflect.prompts import (
+        _TOOLS_LANGUAGE_RULE,
+        build_agent_user_prompt,
+        build_system_prompt_for_tools,
+    )
+
+    system_prompt = build_system_prompt_for_tools({"name": "Bank"}, llm_output_language="Korean")
+    user_prompt = build_agent_user_prompt("질문", llm_output_language="Korean")
+
+    assert _TOOLS_LANGUAGE_RULE not in system_prompt
+    assert output_language_directive("Korean") not in system_prompt, "the directive belongs on the user message"
+    assert user_prompt == "질문" + output_language_directive("Korean")
+
+
+def test_reflect_agent_loop_unset_requires_source_language():
+    from hindsight_api.engine.reflect.prompts import (
+        _TOOLS_LANGUAGE_RULE,
+        build_agent_user_prompt,
+        build_system_prompt_for_tools,
+    )
+
+    system_prompt = build_system_prompt_for_tools({"name": "Bank"}, llm_output_language=None)
+
+    assert _TOOLS_LANGUAGE_RULE in system_prompt
+    assert "Respond exclusively in" not in system_prompt
+    assert build_agent_user_prompt("question", llm_output_language=None) == "question"
+
+
 # ---------------------------------------------------------------------------
 # Migration shape regression test
 # ---------------------------------------------------------------------------

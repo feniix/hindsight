@@ -20,6 +20,7 @@ from .prompts import (
     _SPLIT_SYNTHESIS_WARN_CHUNKS,
     CLAIMS_SYSTEM_PROMPT,
     _extract_directive_rules,
+    build_agent_user_prompt,
     build_chunk_claims_prompt,
     build_final_prompt,
     build_final_system_prompt,
@@ -535,10 +536,11 @@ async def _run_reflect_agent_inner(
         include_observations=include_observations,
         budget=budget,
         answer_as_document=answer_as_document,
+        llm_output_language=llm_output_language,
     )
     messages: list[dict[str, Any]] = [
         {"role": "system", "content": system_prompt},
-        {"role": "user", "content": query},
+        {"role": "user", "content": build_agent_user_prompt(query, llm_output_language)},
     ]
 
     # Step-by-step context caching for the agentic tool loop.
