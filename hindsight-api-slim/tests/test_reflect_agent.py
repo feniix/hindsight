@@ -15,11 +15,11 @@ import pytest
 
 from hindsight_api.cancellation import OperationCancelledError
 from hindsight_api.engine.llm_interface import LLM_TOOL_CHOICE_AUTO, LLMToolChoice
+from hindsight_api.engine.llm_wrapper import LLMConfig
 from hindsight_api.engine.reflect.agent import (
     ReflectNoAnswerError,
     ReflectToolCallError,
     ReflectToolExecutionError,
-    _all_mental_models_are_usable_and_fresh,
     _cache_cleanup_tasks,
     _count_messages_tokens,
     _generate_structured_output,
@@ -85,43 +85,6 @@ class TestToolNameNormalization:
         assert _is_done_tool("functions.recall") is False
         assert _is_done_tool("call=functions.recall") is False
         assert _is_done_tool("recall<|channel|>done") is False
-
-
-class TestMentalModelFreshnessHelper:
-    """Deterministic freshness/usability guard for short-circuiting forced retrieval."""
-
-    def test_all_fresh_and_non_empty_is_usable(self):
-        output = {
-            "mental_models": [
-                {"id": "mm-1", "content": "Fresh content.", "is_stale": False},
-                {"id": "mm-2", "content": "More fresh content.", "is_stale": False},
-            ]
-        }
-        assert _all_mental_models_are_usable_and_fresh(output) is True
-
-    def test_any_stale_model_is_not_usable(self):
-        output = {
-            "mental_models": [
-                {"id": "mm-1", "content": "Fresh content.", "is_stale": False},
-                {"id": "mm-2", "content": "Old content.", "is_stale": True},
-            ]
-        }
-        assert _all_mental_models_are_usable_and_fresh(output) is False
-
-    def test_missing_staleness_flag_is_not_usable(self):
-        # An unknown/missing staleness flag must be treated as unsafe.
-        output = {"mental_models": [{"id": "mm-1", "content": "Fresh content."}]}
-        assert _all_mental_models_are_usable_and_fresh(output) is False
-
-    def test_blank_content_is_not_usable(self):
-        output = {"mental_models": [{"id": "mm-1", "content": "   ", "is_stale": False}]}
-        assert _all_mental_models_are_usable_and_fresh(output) is False
-
-    def test_empty_list_is_vacuously_usable(self):
-        # The caller gates on a non-empty list separately; the helper itself is
-        # only responsible for freshness/content of the models it is given.
-        assert _all_mental_models_are_usable_and_fresh({"mental_models": []}) is True
-        assert _all_mental_models_are_usable_and_fresh({}) is True
 
 
 class TestReflectStructuredOutput:
@@ -306,12 +269,10 @@ class TestReflectAgentMocked:
         )
 
     @pytest.mark.asyncio
-    async def test_fresh_mental_model_releases_forced_retrieval(self, mock_llm, mock_functions):
-        """A fresh, usable mental model stops forced lower-level retrieval — with no extra LLM call.
-
-        The agent answers on the very next (auto) iteration, so search_observations
-        and recall are never invoked.
-        """
+    async def test_disabled_lower_retrieval_allows_page_only_answer(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """Explicitly disabled lower layers are not forced, regardless of page freshness."""
         mock_functions["search_mental_models_fn"].return_value = {
             "query": "test query",
             "mental_models": [
@@ -334,17 +295,18 @@ class TestReflectAgentMocked:
             query="test query",
             bank_profile={"name": "Test", "mission": "Testing"},
             has_mental_models=True,
+            include_observations=False,
+            include_recall=False,
             budget="low",
             max_iterations=5,
             **mock_functions,
         )
 
         assert result.text == "Be concise."
-        # The fix's whole point: no extra LLM round-trip to decide sufficiency.
         mock_llm.call.assert_not_called()
         mock_functions["search_observations_fn"].assert_not_called()
         mock_functions["recall_fn"].assert_not_called()
-        # First iteration forced mental models; second was released to auto.
+        # Mental models are the only enabled retrieval tool.
         first_choice = mock_llm.call_with_tools.await_args_list[0].kwargs["tool_choice"]
         assert first_choice == LLMToolChoice.named("search_mental_models")
         assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
@@ -626,8 +588,10 @@ class TestReflectAgentMocked:
         mock_llm.call.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_short_circuited_agent_may_still_retrieve_under_auto(self, mock_llm, mock_functions):
-        """After release, the agent can still choose to retrieve deeper itself (its own query)."""
+    async def test_disabled_observations_still_forces_targeted_recall(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock]
+    ) -> None:
+        """Skipping disabled observations must not skip enabled recall after fresh pages."""
         mock_functions["search_mental_models_fn"].return_value = {
             "query": "test query",
             "mental_models": [
@@ -658,15 +622,15 @@ class TestReflectAgentMocked:
             query="test query",
             bank_profile={"name": "Test", "mission": "Testing"},
             has_mental_models=True,
+            include_observations=False,
             budget="low",
             max_iterations=5,
             **mock_functions,
         )
 
         assert result.text == "Confirmed."
-        # recall ran because the model chose it under auto, not because it was forced,
-        # and it used the model's own targeted query (not a forced override).
-        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
+        # Force the tool, but leave query formulation to the model.
+        assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == LLMToolChoice.named("recall")
         mock_functions["recall_fn"].assert_called_once()
         assert mock_functions["recall_fn"].await_args.args[0] == "launch completion proof"
         mock_functions["search_observations_fn"].assert_not_called()
@@ -726,12 +690,15 @@ class TestReflectAgentMocked:
         ]
 
     @pytest.mark.asyncio
-    async def test_high_budget_keeps_forced_path_for_fresh_mental_model(self, mock_llm, mock_functions):
-        """High budget preserves the full verification path even for fresh mental models."""
+    @pytest.mark.parametrize("budget", ["low", "mid", "high"])
+    async def test_fresh_mental_model_keeps_forced_retrieval(
+        self, mock_llm: MagicMock, mock_functions: dict[str, AsyncMock], budget: str
+    ) -> None:
+        """Fresh pages do not establish coverage: raw facts may hold the answer (#4567)."""
         mock_functions["search_mental_models_fn"].return_value = {
             "query": "test query",
             "mental_models": [
-                {"id": "mm-1", "name": "Prefs", "content": "Fresh and directly relevant.", "is_stale": False}
+                {"id": "mm-1", "name": "Prefs", "content": "The user prefers concise answers.", "is_stale": False}
             ],
         }
         mock_llm.call_with_tools.side_effect = [
@@ -755,10 +722,10 @@ class TestReflectAgentMocked:
         result = await run_reflect_agent(
             llm_config=mock_llm,
             bank_id="test-bank",
-            query="test query",
+            query="Where do we stand on ISSUE-4567?",
             bank_profile={"name": "Test", "mission": "Testing"},
             has_mental_models=True,
-            budget="high",
+            budget=budget,
             max_iterations=5,
             **mock_functions,
         )
@@ -769,6 +736,8 @@ class TestReflectAgentMocked:
         assert mock_llm.call_with_tools.await_args_list[1].kwargs["tool_choice"] == LLMToolChoice.named(
             "search_observations"
         )
+        assert mock_llm.call_with_tools.await_args_list[2].kwargs["tool_choice"] == LLMToolChoice.named("recall")
+        assert mock_llm.call_with_tools.await_args_list[3].kwargs["tool_choice"] is LLM_TOOL_CHOICE_AUTO
 
     @pytest.mark.asyncio
     async def test_no_mental_models_keeps_forced_retrieval(self, mock_llm, mock_functions):
@@ -1853,14 +1822,8 @@ class TestContextOverflowIntegration:
 
 @pytest.mark.hs_llm_core
 @pytest.mark.flaky(reruns=3, reruns_delay=2)
-class TestMentalModelShortCircuitRealLLM:
-    """End-to-end, real-LLM coverage for the fresh-mental-model short-circuit.
-
-    The deterministic release-to-auto mechanism is covered by the MockLLM tests
-    above. What only a real model can verify is the behaviour *after* release:
-    that a real agent, once it is no longer forced, actually answers off a fresh
-    sufficient mental model — and, when the model is fresh but incomplete, that
-    it chooses to retrieve deeper itself with its own targeted query.
+class TestMentalModelRetrievalRealLLM:
+    """Real-LLM coverage for grounding answers across the retrieval layers.
 
     The search functions are stubbed so the mental-model content is controlled,
     but ``llm_config`` drives the real agent loop.
@@ -1879,8 +1842,8 @@ class TestMentalModelShortCircuitRealLLM:
         }
 
     @pytest.mark.asyncio
-    async def test_real_fresh_mental_model_answers_without_lower_retrieval(self, llm_config):
-        """A fresh, sufficient mental model lets the real agent answer without obs/recall."""
+    async def test_real_fresh_mental_model_answer_survives_empty_lower_layers(self, llm_config: LLMConfig) -> None:
+        """Empty lower layers must not erase an answer supported by a fresh page."""
         functions = self._stub_functions(
             mental_models=[
                 {
@@ -1911,10 +1874,8 @@ class TestMentalModelShortCircuitRealLLM:
         )
 
         assert result.text, "agent must return a non-empty answer"
-        # The core behavioural win: the forced lower-level path was released, and a
-        # real model answered off the fresh mental model instead of digging deeper.
-        functions["search_observations_fn"].assert_not_called()
-        functions["recall_fn"].assert_not_called()
+        assert functions["search_observations_fn"].await_count > 0
+        assert functions["recall_fn"].await_count > 0
         await assert_meets_criteria(
             response=result.text,
             criteria=(
@@ -1926,13 +1887,7 @@ class TestMentalModelShortCircuitRealLLM:
 
     @pytest.mark.asyncio
     async def test_real_stale_mental_model_forces_and_grounds_in_deeper_evidence(self, llm_config):
-        """A stale mental model must NOT short-circuit: the agent is forced deeper and grounds its answer there.
-
-        This is the safety side of the guard. Forcing the lower layers is
-        deterministic (stale fails the freshness check), so observations/recall
-        run regardless of model discretion; the real-LLM value is confirming the
-        agent corrects the stale summary using the freshly retrieved raw fact.
-        """
+        """The agent corrects a stale summary using the freshly retrieved raw fact."""
         functions = self._stub_functions(
             mental_models=[
                 {
@@ -1972,7 +1927,6 @@ class TestMentalModelShortCircuitRealLLM:
         )
 
         assert result.text, "agent must return a non-empty answer"
-        # Stale mental model → no short-circuit → lower layers are still forced.
         assert functions["search_observations_fn"].await_count > 0
         assert functions["recall_fn"].await_count > 0
         await assert_meets_criteria(
@@ -1983,6 +1937,56 @@ class TestMentalModelShortCircuitRealLLM:
             ),
             context="A stale mental model claimed the launch was still pending, but the freshly retrieved raw "
             "fact (deploy log A-1029) shows it shipped on Friday. The agent should correct the stale summary.",
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("budget", ["low", "mid"])
+    async def test_real_fresh_unrelated_page_does_not_hide_issue_facts(
+        self, llm_config: LLMConfig, budget: str
+    ) -> None:
+        """The coding-agent absence instruction must not win over evidence in recall (#4567)."""
+        functions = self._stub_functions(
+            mental_models=[
+                {
+                    "id": "mm-prefs",
+                    "name": "Team preferences",
+                    "content": "The team prefers concise written updates and asynchronous architecture reviews.",
+                    "is_stale": False,
+                }
+            ],
+            recall_memories=[
+                {
+                    "id": "mem-issue",
+                    "content": (
+                        "ISSUE-4567 remains open. Its three defects are duplicate invoice rows, missing tax "
+                        "totals, and incorrect refund dates. Maya is implementing the fix; review is due Friday."
+                    ),
+                }
+            ],
+        )
+        result = await run_reflect_agent(
+            llm_config=llm_config,
+            bank_id="test-bank",
+            query=(
+                "What project memory bears on this goal: lets see where we stand on ISSUE-4567? "
+                "If the bank holds nothing that bears on the goal, say so in one line."
+            ),
+            bank_profile={"name": "Test", "mission": "Answer from project memory"},
+            has_mental_models=True,
+            budget=budget,
+            max_iterations=6,
+            **functions,
+        )
+        assert functions["search_observations_fn"].await_count > 0
+        assert functions["recall_fn"].await_count > 0
+        await assert_meets_criteria(
+            response=result.text,
+            criteria=(
+                "The answer reports that ISSUE-4567 is open, describes the invoice/tax/refund defects, "
+                "and identifies Maya as implementing the fix with review due Friday. "
+                "It must not claim the bank has no relevant issue history."
+            ),
+            context="Fresh pages contain only unrelated team preferences; raw recall contains the issue status.",
         )
 
 
@@ -2091,7 +2095,7 @@ class TestReflectIncrementalCache:
             has_mental_models=False,
             include_observations=True,
             include_recall=True,
-            budget="high",  # keep the full forced path (no early release) so counts are deterministic
+            budget="high",
             max_iterations=8,
             **functions,
         )
