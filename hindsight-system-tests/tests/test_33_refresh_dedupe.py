@@ -38,6 +38,9 @@ def hindsight_server(stub_server: StubServer, tmp_path_factory: pytest.TempPathF
         log_path=log_path,
         database_url=f"pg0://hindsight-systest-refresh-dedupe:{free_port()}",
         extra_env={
+            # One slot, so a single held refresh occupies the whole worker. The
+            # default consolidation reservation exceeds that slot and the server
+            # refuses to start with reservations above the pool, hence the zero.
             "HINDSIGHT_API_WORKER_MAX_SLOTS": "1",
             "HINDSIGHT_API_WORKER_CONSOLIDATION_RESERVED_SLOTS": "0",
         },

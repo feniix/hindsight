@@ -27,6 +27,10 @@ exercised for real.
   would 400, so does the stub.
 - **Embeddings are lexical and deterministic**, so the suite needs no torch and no
   model download.
+- **A response can be held.** `llm.hold_responses()` parks every scripted reply
+  until the story releases the gate, so a test can pin the worker in `processing`
+  and assert what a second request does meanwhile — without sleeping, and
+  without depending on how fast the machine drains the queue.
 
 ## Running
 
@@ -46,7 +50,11 @@ means it runs on fork PRs — unlike every `test-api` job.
 The fixtures start their own embedded Postgres (`pg0://hindsight-systest:15499`),
 separate from the dev database and from the api-slim suite's, and run the server
 from a scratch directory holding an empty `.env` so your own `.env` cannot leak
-into the test configuration.
+into the test configuration. A story that needs a worker of its own boots a second
+server on a second instance (`test_33` uses `hindsight-systest-refresh-dedupe`, on a
+free port), so the session server's worker cannot claim the jobs it deliberately
+queues. Both instances persist under `~/.pg0/instances/`; every server sweeps the
+suite's leftover banks at startup, whichever database it points at.
 
 If your shell exports `PYTEST_ADDOPTS=-n ...`, clear it for this suite —
 `pytest-xdist` is not installed here, and the session-scoped server makes it
@@ -63,3 +71,6 @@ switches it on for its own bank and waits for the operation to finish.
 - One story per file, named `test_NN_<story>.py`. The number is **reading order for
   a human, not execution order** — every test must pass when run alone.
 - Assert through the client's responses only.
+- `tests/harness/` holds the harness's own self-tests (the response gate, and the
+  like). They test the stub, not Hindsight, so they carry no story number and
+  need no server.

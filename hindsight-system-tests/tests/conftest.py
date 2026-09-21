@@ -9,7 +9,6 @@ silently.
 
 from __future__ import annotations
 
-import asyncio
 import contextlib
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator
@@ -19,6 +18,7 @@ import pytest
 from hindsight_client import Hindsight
 
 from hindsight_system_tests import (
+    BANK_PREFIX,
     LLMStub,
     Stubs,
     start_hindsight_server,
@@ -27,8 +27,6 @@ from hindsight_system_tests import (
 )
 
 SettleFn = Callable[[str], Awaitable[None]]
-
-BANK_PREFIX = "systest-"
 
 
 @pytest.fixture(scope="session")
@@ -47,9 +45,6 @@ def stub_server(stubs: Stubs) -> Iterator[object]:
 def hindsight_server(stub_server, tmp_path_factory: pytest.TempPathFactory) -> Iterator[object]:
     log_path: Path = tmp_path_factory.mktemp("hindsight-server") / "server.log"
     server = start_hindsight_server(stub_url=stub_server.url, log_path=log_path)
-    # Sweep before the first test rather than after the last one: a run killed
-    # mid-test leaves banks behind, and only a sweep at startup catches those.
-    asyncio.run(_delete_leftover_banks(server.url))
     yield server
     server.stop()
 
@@ -175,14 +170,3 @@ async def bank_id(client: Hindsight) -> AsyncIterator[str]:
     with contextlib.suppress(Exception):
         await client.banks.delete_bank(name)
 
-
-async def _delete_leftover_banks(base_url: str) -> None:
-    client = Hindsight(base_url=base_url)
-    try:
-        banks = await client.banks.list_banks()
-        for bank in banks.banks:
-            if bank.bank_id.startswith(BANK_PREFIX):
-                with contextlib.suppress(Exception):
-                    await client.banks.delete_bank(bank.bank_id)
-    finally:
-        await client.aclose()

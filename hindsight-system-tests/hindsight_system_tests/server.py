@@ -8,6 +8,7 @@ environment variables that any deployment could set.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import os
@@ -20,6 +21,7 @@ from pathlib import Path
 
 import httpx
 import uvicorn
+from hindsight_client import Hindsight
 
 from .rulebook import Stubs
 from .stub_server import create_stub_app
@@ -34,6 +36,10 @@ API_DIR = REPO_ROOT / "hindsight-api-slim"
 # tests at that one would both see their leftovers and block on their locks.
 PG0_INSTANCE = "hindsight-systest"
 PG0_PORT = 15499
+
+# Every bank the suite creates carries this prefix, so a sweep can tell the
+# suite's leftovers from anything else living in the same database.
+BANK_PREFIX = "systest-"
 
 SERVER_STARTUP_TIMEOUT = 180.0
 
@@ -228,7 +234,26 @@ def start_hindsight_server(
     url = f"http://127.0.0.1:{port}"
     server = HindsightServer(url=url, log_path=log_path, _process=process)
     _wait_until_healthy(server)
+    # Sweep before the first test rather than after the last one: a run killed
+    # mid-test leaves banks behind, and only a sweep at startup catches those.
+    # It lives here, not in the session fixture it started in, so a story that
+    # boots its own database (test_33) is swept too — a refresh it deliberately
+    # held is exactly what a killed run leaves behind, and the next server's
+    # worker would resume it with an LLM call no test declared.
+    asyncio.run(_delete_leftover_banks(url))
     return server
+
+
+async def _delete_leftover_banks(base_url: str) -> None:
+    client = Hindsight(base_url=base_url)
+    try:
+        banks = await client.banks.list_banks()
+        for bank in banks.banks:
+            if bank.bank_id.startswith(BANK_PREFIX):
+                with contextlib.suppress(Exception):
+                    await client.banks.delete_bank(bank.bank_id)
+    finally:
+        await client.aclose()
 
 
 def _wait_until_healthy(server: HindsightServer) -> None:
