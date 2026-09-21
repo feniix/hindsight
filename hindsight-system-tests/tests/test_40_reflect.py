@@ -16,10 +16,13 @@ the mechanism around it.
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable
+
 import pytest
+from hindsight_client import Hindsight
 from hindsight_client_api.exceptions import ApiException
 
-from hindsight_system_tests import reflect_loop
+from hindsight_system_tests import LLMStub, reflect_loop
 from hindsight_system_tests.payloads import consolidation, extracted, fact
 
 pytestmark = pytest.mark.asyncio
@@ -102,3 +105,40 @@ async def test_reflect_reports_what_the_answer_cost(client, llm, bank_with_facts
 
     assert response.usage.total_tokens > 0
     assert response.usage.input_tokens > 0
+
+
+@pytest.mark.parametrize("budget", ["low", "mid"])
+async def test_fresh_page_does_not_skip_lower_evidence(
+    client: Hindsight,
+    llm: LLMStub,
+    bank_with_facts: str,
+    settled: Callable[[str], Awaitable[None]],
+    budget: str,
+) -> None:
+    """A fresh page can miss facts that recall holds; freshness is not coverage (#4567)."""
+    llm.on_step("reflect", tool="done", contains="What does Alice prefer?").returns_tool_call(
+        "done", answer="Alice prefers concise written updates."
+    )
+    reflect_loop(llm, answer=ANSWER, query=QUERY)
+    created = await client.mental_models.create_mental_model(
+        bank_with_facts, {"name": "Alice preferences", "source_query": "What does Alice prefer?"}
+    )
+    await settled(bank_with_facts)
+    page = await client.mental_models.get_mental_model(bank_with_facts, created.mental_model_id, detail="full")
+    assert page.is_stale is False
+
+    response = await client.areflect(bank_id=bank_with_facts, query=QUERY, budget=budget, include_tool_calls=True)
+
+    assert response.text == ANSWER
+    assert response.trace is not None
+    calls = response.trace.tool_calls
+    assert calls is not None
+    assert [call.tool for call in calls] == ["search_mental_models", "search_observations", "recall"]
+    assert calls[0].output is not None
+    assert calls[0].output["mental_models"][0]["content"] == "Alice prefers concise written updates.\n"
+    assert calls[0].output["mental_models"][0]["is_stale"] is False
+    assert calls[2].output is not None
+    assert {memory["text"] for memory in calls[2].output["memories"]} == {
+        "Alice moved to Berlin | Involving: Alice",
+        "Alice renewed her Berlin lease | Involving: Alice",
+    }
