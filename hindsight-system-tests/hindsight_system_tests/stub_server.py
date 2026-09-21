@@ -66,6 +66,7 @@ def create_stub_app(stubs: Stubs) -> FastAPI:
                 code="no_stub_rule",
             )
 
+        await stubs.llm.wait_if_held()
         return JSONResponse(
             {
                 "id": "chatcmpl-stub",

@@ -19,12 +19,43 @@ a new system test is mechanical: run it, paste the suggested rule, run again.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from collections.abc import Callable
+import threading
+from collections.abc import Callable, Iterator
+from concurrent.futures import Future
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
 from pydantic import BaseModel
+
+
+class ResponseGate:
+    """Hold real provider responses until the test releases them.
+
+    The test and HTTP stub run on different event loops/threads, so use
+    concurrent futures and wrap them on the loop doing the waiting.
+    """
+
+    def __init__(self) -> None:
+        self._entered: Future[None] = Future()
+        self._released: Future[None] = Future()
+        self._lock = threading.Lock()
+
+    async def wait_until_entered(self) -> None:
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(self._entered)), timeout=15)
+
+    async def wait_for_release(self) -> None:
+        with self._lock:
+            if not self._entered.done():
+                self._entered.set_result(None)
+        await asyncio.wait_for(asyncio.shield(asyncio.wrap_future(self._released)), timeout=30)
+
+    def release(self) -> None:
+        with self._lock:
+            if not self._released.done():
+                self._released.set_result(None)
 
 
 @dataclass(frozen=True)
@@ -231,6 +262,7 @@ class LLMStub:
 
     def __init__(self) -> None:
         self._rules: list[ChatRule] = []
+        self._response_gate: ResponseGate | None = None
         self.unmatched: list[UnmatchedCall] = []
         self.calls: list[ChatRequest] = []
         """Every call the stub answered, in order.
@@ -241,6 +273,24 @@ class LLMStub:
         asserted directly rather than judged.
         """
         self._install_builtins()
+
+    @contextmanager
+    def hold_responses(self) -> Iterator[ResponseGate]:
+        """Pause scripted responses without blocking the stub's HTTP loop."""
+        if self._response_gate is not None:
+            raise RuntimeError("A response gate is already active")
+        gate = ResponseGate()
+        self._response_gate = gate
+        try:
+            yield gate
+        finally:
+            self._response_gate = None
+            gate.release()
+
+    async def wait_if_held(self) -> None:
+        gate = self._response_gate
+        if gate is not None:
+            await gate.wait_for_release()
 
     def _install_builtins(self) -> None:
         """Answer the calls that are startup plumbing rather than test subject matter.
