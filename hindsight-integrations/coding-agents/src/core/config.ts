@@ -91,6 +91,11 @@ export interface RawConfig {
    *  the repos beneath it, and each still gets its own dynamic bank. A `mapPathToBank` entry counts
    *  as opted in too, since routing a path to a named bank already declares that project. */
   optInPaths?: string[];
+  /** The name our MCP server is registered under in every host's config (default "hindsight").
+   *  Read by the installer and the Trae SessionStart hook only, from this file's top level —
+   *  never from a layer. Set it with `install --mcp-name <name>` so the hosts are rewired too;
+   *  editing it by hand changes nothing until the next install. See core/mcp-name.ts. */
+  mcpServerName?: string;
   harness?: string; // runtime adapter (default "opencode")
   disabled?: boolean; // hard off-switch — inert plugin, for a no-memory baseline (default false)
   /** Session transcript write-back (default true; set false to opt out). Honored by every

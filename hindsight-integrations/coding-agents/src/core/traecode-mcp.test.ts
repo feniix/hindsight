@@ -89,6 +89,24 @@ describe("ensureTraecodeWorkspaceMcp", () => {
     });
   });
 
+  it("the SessionStart path registers under the mcpServerName the installer saved", () => {
+    // The hook passes no serverName — it reads the same config file `install --mcp-name` wrote.
+    const { repo: r, dist, home } = repo();
+    mkdirSync(join(home, ".hindsight"), { recursive: true });
+    writeFileSync(
+      join(home, ".hindsight", "coding-agent.json"),
+      JSON.stringify({ mcpServerName: "hindsight-code" })
+    );
+    const saved = process.env.HINDSIGHT_CONFIG;
+    delete process.env.HINDSIGHT_CONFIG; // a developer's override must not redirect the read
+    try {
+      ensureTraecodeWorkspaceMcp(r, { dist, home, stateFile: STATE });
+    } finally {
+      if (saved !== undefined) process.env.HINDSIGHT_CONFIG = saved;
+    }
+    expect(Object.keys(readJson(r).mcpServers)).toEqual(["hindsight-code"]);
+  });
+
   it("is idempotent: a second run rewrites nothing", () => {
     const { repo: r, dist, home } = repo();
     ensureTraecodeWorkspaceMcp(r, { dist, home, stateFile: STATE });
