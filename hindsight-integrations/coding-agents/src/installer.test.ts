@@ -981,6 +981,23 @@ describe("traecode installer", () => {
     expect(logs.join("\n")).toMatch(/2 written, 0 already current, 1 skipped/);
   });
 
+  it("--mcp-name moves each repo's registration to the new name", () => {
+    const ctx = ctxWithRealDist();
+    const repo = repoDir(ctx, "repo-a");
+    mkdirSync(repo, { recursive: true });
+    writeMapConfig(ctx, { [repo]: "Agent::A" });
+    expect(run(["install", "traecode"], ctx)).toBe(0);
+    expect(Object.keys(readJson(repoMcp(ctx, "repo-a")).mcpServers)).toEqual(["hindsight"]);
+
+    expect(run(["install", "traecode", "--mcp-name", "hindsight-code"], ctx)).toBe(0);
+    const servers = readJson(repoMcp(ctx, "repo-a")).mcpServers;
+    expect(Object.keys(servers)).toEqual(["hindsight-code"]);
+    expect(servers["hindsight-code"].env.HINDSIGHT_MCP_PROJECT_CWD).toBe(repo);
+
+    expect(run(["uninstall", "traecode"], ctx)).toBe(0);
+    expect(existsSync(repoMcp(ctx, "repo-a"))).toBe(false);
+  });
+
   it("re-install leaves a current registration byte-identical and reports it", () => {
     const ctx = ctxWithRealDist();
     mkdirSync(repoDir(ctx, "repo-a"), { recursive: true });
@@ -3311,5 +3328,232 @@ describe("nodeCommand", () => {
   it("quotes the script path only when it contains a space", () => {
     expect(nodeCommand("C:\\Users\\me\\dist\\hook.js")).toBe("node C:\\Users\\me\\dist\\hook.js");
     expect(nodeCommand("/Users/my name/dist/hook.js")).toBe('node "/Users/my name/dist/hook.js"');
+  });
+});
+
+/**
+ * `--mcp-name`: our server under a name of the user's choosing, so a Hindsight server of their
+ * own (say, one for application support) can keep `hindsight`. The invariants, per host family:
+ * the new name is what gets written, the old registration of OURS moves with it, and a FOREIGN
+ * server under either name is never touched.
+ */
+describe("custom MCP server name (--mcp-name)", () => {
+  const NAME = "hindsight-code";
+  const configPath = (ctx: InstallCtx) => join(ctx.home, ".hindsight", "coding-agent.json");
+  /** A user's own Hindsight server: same name we default to, nothing of ours in it. */
+  const FOREIGN = { command: "uvx", args: ["hindsight-local-mcp"], env: { BANK: "support" } };
+
+  // Same roster as "MCP registrations name the calling harness": every host the installer writes
+  // an MCP registration for, file- or CLI-based.
+  const NO_INSTALLER_MCP = new Set([
+    "opencode",
+    "opencode2",
+    "kilo",
+    "pi",
+    "prime-agent",
+    "dsh",
+    "dcode",
+    "traecode",
+  ]);
+  const MCP_HOSTS = INSTALLERS.map((i) => i.name).filter((n) => !NO_INSTALLER_MCP.has(n));
+
+  function filesUnder(dir: string): string[] {
+    return readdirSync(dir, { withFileTypes: true }).flatMap((e) =>
+      e.isDirectory() ? filesUnder(join(dir, e.name)) : [join(dir, e.name)]
+    );
+  }
+
+  it.each(MCP_HOSTS)("%s registers under the chosen name, never the default", (harness) => {
+    const ctx = makeCtx();
+    expect(run(["install", harness, "--mcp-name", NAME], ctx)).toBe(0);
+    const registrations = filesUnder(ctx.home)
+      .filter((f) => f !== configPath(ctx))
+      .map((f) => readFileSync(f, "utf8"))
+      .concat(ctx.claudeMcp.mock.calls.map((c) => c[0].join(" ")))
+      .concat(ctx.qwenMcp.mock.calls.map((c) => c[0].join(" ")))
+      .filter((text) => text.includes("mcp-server.js"));
+    expect(registrations.length).toBeGreaterThan(0);
+    for (const text of registrations) {
+      expect(text).toContain(NAME);
+      // JSON key, TOML table header, or CLI argument under the default name: all must be gone.
+      expect(text).not.toMatch(/"hindsight"\s*:|\[mcp_servers\.hindsight\]| hindsight /);
+    }
+  });
+
+  it("persists the name, so a later install and uninstall use it without the flag", () => {
+    const ctx = makeCtx();
+    const mcpPath = join(ctx.home, ".cursor", "mcp.json");
+    expect(run(["install", "cursor-cli", "--mcp-name", NAME], ctx)).toBe(0);
+    expect(readJson(configPath(ctx)).mcpServerName).toBe(NAME);
+
+    expect(run(["install", "cursor-cli"], ctx)).toBe(0);
+    expect(Object.keys(readJson(mcpPath).mcpServers)).toEqual([NAME]);
+
+    expect(run(["uninstall", "cursor-cli"], ctx)).toBe(0);
+    expect(readJson(mcpPath).mcpServers).toEqual({});
+  });
+
+  it("going back to the default removes the key rather than storing the default", () => {
+    const ctx = makeCtx();
+    expect(run(["install", "cursor-cli", "--mcp-name", NAME], ctx)).toBe(0);
+    expect(run(["install", "cursor-cli", "--mcp-name", "hindsight"], ctx)).toBe(0);
+    expect(readJson(configPath(ctx))).not.toHaveProperty("mcpServerName");
+    expect(Object.keys(readJson(join(ctx.home, ".cursor", "mcp.json")).mcpServers)).toEqual([
+      "hindsight",
+    ]);
+  });
+
+  it("a rename moves our JSON registration and leaves a foreign server under the old name", () => {
+    const ctx = makeCtx();
+    const mcpPath = join(ctx.home, ".cursor", "mcp.json");
+    expect(run(["install", "cursor-cli"], ctx)).toBe(0);
+    expect(run(["install", "cursor-cli", "--mcp-name", NAME], ctx)).toBe(0);
+    expect(Object.keys(readJson(mcpPath).mcpServers)).toEqual([NAME]);
+
+    // The case the flag exists for: the user's own `hindsight` sits beside ours, untouched by
+    // install and uninstall alike.
+    const other = makeCtx();
+    const otherPath = join(other.home, ".cursor", "mcp.json");
+    writeJsonAt(otherPath, { mcpServers: { hindsight: FOREIGN } });
+    expect(run(["install", "cursor-cli", "--mcp-name", NAME], other)).toBe(0);
+    expect(readJson(otherPath).mcpServers.hindsight).toEqual(FOREIGN);
+    expect(readJson(otherPath).mcpServers[NAME].args[0]).toContain("mcp-server.js");
+    expect(run(["uninstall", "cursor-cli"], other)).toBe(0);
+    expect(readJson(otherPath).mcpServers).toEqual({ hindsight: FOREIGN });
+  });
+
+  it("uninstall never deletes a foreign server under our name", () => {
+    // Hosts like cursor/devin/copilot used to delete `mcpServers.hindsight` on uninstall
+    // whatever it pointed at.
+    const ctx = makeCtx();
+    const mcpPath = join(ctx.home, ".cursor", "mcp.json");
+    writeJsonAt(mcpPath, { mcpServers: { hindsight: FOREIGN } });
+    expect(run(["uninstall", "cursor-cli"], ctx)).toBe(0);
+    expect(readJson(mcpPath).mcpServers).toEqual({ hindsight: FOREIGN });
+  });
+
+  it("a foreign server under the default name no longer blocks a preflighted host", () => {
+    const ctx = makeCtx();
+    const mcpPath = join(ctx.home, ".factory", "mcp.json");
+    writeJsonAt(mcpPath, { mcpServers: { hindsight: FOREIGN } });
+    const logs: string[] = [];
+    expect(run(["install", "factory-droid"], { ...ctx, log: (m) => logs.push(m) })).toBe(1);
+    expect(logs.join("\n")).toContain("--mcp-name");
+
+    expect(run(["install", "factory-droid", "--mcp-name", NAME], ctx)).toBe(0);
+    expect(readJson(mcpPath).mcpServers.hindsight).toEqual(FOREIGN);
+    expect(readJson(mcpPath).mcpServers[NAME].env.HINDSIGHT_MCP_HARNESS).toBe("factory-droid");
+  });
+
+  it("claude-code: a rename removes the old registration only when ~/.claude.json shows it is ours", () => {
+    const ours = makeCtx();
+    writeJsonAt(join(ours.home, ".claude.json"), {
+      mcpServers: { hindsight: { command: "node", args: [join(ours.dist, "mcp-server.js")] } },
+    });
+    expect(run(["install", "claude-code", "--mcp-name", NAME], ours)).toBe(0);
+    const calls = ours.claudeMcp.mock.calls.map((c) => c[0].join(" "));
+    expect(calls).toContain("mcp remove --scope user hindsight");
+    expect(calls.some((c) => c.startsWith(`mcp add --scope user ${NAME} `))).toBe(true);
+
+    const foreign = makeCtx();
+    writeJsonAt(join(foreign.home, ".claude.json"), { mcpServers: { hindsight: FOREIGN } });
+    expect(run(["install", "claude-code", "--mcp-name", NAME], foreign)).toBe(0);
+    const foreignCalls = foreign.claudeMcp.mock.calls.map((c) => c[0].join(" "));
+    expect(foreignCalls).not.toContain("mcp remove --scope user hindsight");
+    expect(foreignCalls).toContain(`mcp remove --scope user ${NAME}`);
+  });
+
+  it("qwen-code: same ownership check against ~/.qwen/settings.json", () => {
+    const ctx = makeCtx();
+    writeJsonAt(join(ctx.home, ".qwen", "settings.json"), { mcpServers: { hindsight: FOREIGN } });
+    expect(run(["install", "qwen-code", "--mcp-name", NAME], ctx)).toBe(0);
+    const calls = ctx.qwenMcp.mock.calls.map((c) => c[0].join(" "));
+    expect(calls).not.toContain("mcp remove hindsight");
+    expect(calls.some((c) => c.includes(` ${NAME} `))).toBe(true);
+  });
+
+  it("codex: a rename replaces our TOML table and keeps a foreign one", () => {
+    const ctx = makeCtx();
+    const tomlPath = join(ctx.home, ".codex", "config.toml");
+    expect(run(["install", "codex"], ctx)).toBe(0);
+    writeFileSync(
+      tomlPath,
+      readFileSync(tomlPath, "utf8") + '\n[mcp_servers.support]\ncommand = "uvx"\n'
+    );
+    expect(run(["install", "codex", "--mcp-name", NAME], ctx)).toBe(0);
+    let cfg = parseToml(readFileSync(tomlPath, "utf8")) as Record<string, any>;
+    expect(Object.keys(cfg.mcp_servers).sort()).toEqual([NAME, "support"].sort());
+
+    // Renaming FROM a name a user's own table also uses must not delete theirs.
+    const other = makeCtx();
+    const otherToml = join(other.home, ".codex", "config.toml");
+    mkdirSync(dirname(otherToml), { recursive: true });
+    writeFileSync(
+      otherToml,
+      '[mcp_servers.hindsight]\ncommand = "uvx"\nargs = ["hindsight-local-mcp"]\n'
+    );
+    expect(run(["install", "codex", "--mcp-name", NAME], other)).toBe(0);
+    cfg = parseToml(readFileSync(otherToml, "utf8")) as Record<string, any>;
+    expect(cfg.mcp_servers.hindsight.command).toBe("uvx");
+    expect(cfg.mcp_servers[NAME].args[0]).toContain("mcp-server.js");
+    expect(run(["uninstall", "codex"], other)).toBe(0);
+    cfg = parseToml(readFileSync(otherToml, "utf8")) as Record<string, any>;
+    expect(Object.keys(cfg.mcp_servers)).toEqual(["hindsight"]);
+  });
+
+  it("grok-build: an unmarked foreign [mcp_servers.hindsight] survives once ours is renamed", () => {
+    const ctx = makeCtx();
+    const tomlPath = join(ctx.home, ".grok", "config.toml");
+    mkdirSync(dirname(tomlPath), { recursive: true });
+    writeFileSync(
+      tomlPath,
+      '[mcp_servers.hindsight]\ncommand = "uvx"\nargs = ["hindsight-local-mcp"]\n'
+    );
+    expect(run(["install", "grok-build", "--mcp-name", NAME], ctx)).toBe(0);
+    const cfg = parseToml(readFileSync(tomlPath, "utf8")) as Record<string, any>;
+    expect(cfg.mcp_servers.hindsight.command).toBe("uvx");
+    expect(cfg.mcp_servers[NAME].args[0]).toContain("mcp-server.js");
+  });
+
+  it("prime-agent: the registration and the context block's call_tool both use the name", () => {
+    const ctx = makeCtx();
+    expect(run(["install", "prime-agent", "--mcp-name", NAME], ctx)).toBe(0);
+    const settings = readJson(join(ctx.home, ".prime", "agent", "settings.json"));
+    expect(Object.keys(settings.mcpServers)).toEqual([NAME]);
+    const context = readFileSync(join(ctx.home, ".prime", "agent", "AGENTS.md"), "utf8");
+    expect(context).toContain(`mcp.call_tool("${NAME}", "hindsight_reflect"`);
+  });
+
+  it("rejects an invalid name before writing anything", () => {
+    const ctx = makeCtx();
+    const logs: string[] = [];
+    for (const bad of ["has space", "dot.ted", "-leading", "x".repeat(65)]) {
+      expect(
+        run(["install", "cursor-cli", "--mcp-name", bad], { ...ctx, log: (m) => logs.push(m) })
+      ).toBe(1);
+    }
+    expect(logs.join("\n")).toContain("invalid --mcp-name");
+    expect(existsSync(join(ctx.home, ".cursor"))).toBe(false);
+    expect(existsSync(configPath(ctx))).toBe(false);
+  });
+
+  it("a bad mcpServerName in the config falls back to the default with a warning", () => {
+    const ctx = makeCtx();
+    writeJsonAt(configPath(ctx), { mcpServerName: "no good" });
+    const logs: string[] = [];
+    expect(run(["install", "cursor-cli"], { ...ctx, log: (m) => logs.push(m) })).toBe(0);
+    expect(logs.join("\n")).toContain("ignoring mcpServerName");
+    expect(Object.keys(readJson(join(ctx.home, ".cursor", "mcp.json")).mcpServers)).toEqual([
+      "hindsight",
+    ]);
+  });
+
+  it("the --mcp-name value is not mistaken for a harness name", () => {
+    const ctx = makeCtx();
+    expect(run(["install", "cursor-cli", "--mcp-name", "codex"], ctx)).toBe(0);
+    expect(existsSync(join(ctx.home, ".codex"))).toBe(false);
+    expect(Object.keys(readJson(join(ctx.home, ".cursor", "mcp.json")).mcpServers)).toEqual([
+      "codex",
+    ]);
   });
 });

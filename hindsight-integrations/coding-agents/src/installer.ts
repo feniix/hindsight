@@ -47,6 +47,7 @@ import { PRIME_AGENT_DIR_ENV, PRIME_SESSION_ID_ENV } from "./prime-agent";
 import { detectLlm, hasRustToolchain, hasUvx, type LlmChoice } from "./core/daemon";
 import { readLegacyEndpoint } from "./core/legacy";
 import { hookNode, hookNodeShell, isOurMcpEntry, nodeBinary } from "./core/util";
+import { DEFAULT_MCP_SERVER_NAME, isValidMcpServerName } from "./core/mcp-name";
 import { SKILL_DIRS, resolveSkillDirs, traecodeDotDirName } from "./core/skill-dirs";
 import {
   enableWorkspaceMcpSetting,
@@ -106,6 +107,13 @@ export interface InstallCtx {
   hasRust?: () => boolean;
   /** Reads an old per-agent plugin's endpoint; injectable for tests. */
   readLegacy?: (home: string, prefer: readonly string[]) => ReturnType<typeof readLegacyEndpoint>;
+  /** The name our MCP server is registered under in every host (`--mcp-name`, persisted as
+   *  `mcpServerName`; see core/mcp-name.ts). `run()` always sets it; unset means the default. */
+  mcpName?: string;
+  /** The name a PREVIOUS install registered under, when `--mcp-name` just changed it: install
+   *  drops our entry under it so the host is not left with two copies of the tools. Only ever
+   *  removed when the entry is provably ours — a foreign server of that name is left alone. */
+  previousMcpName?: string;
   /** The raw CLI arguments after the command word — harness installers read flags off this
    *  (e.g. traecode's --enable-workspace-mcp) without each one re-parsing argv. */
   args?: readonly string[];
@@ -263,6 +271,58 @@ const mcpServerEntry = (
   args: [join(dist, "mcp-server.js"), ...extraArgs],
   env: { HINDSIGHT_MCP_HARNESS: harness },
 });
+
+/** The name our server is registered under on this run. */
+const mcpName = (c: InstallCtx): string => c.mcpName ?? DEFAULT_MCP_SERVER_NAME;
+
+/** A name we registered under before but no longer do, or undefined when nothing was renamed. */
+function staleMcpName(c: InstallCtx): string | undefined {
+  const prev = c.previousMcpName;
+  return prev && prev !== mcpName(c) ? prev : undefined;
+}
+
+/** Register `entry` as our server in a host's server map, dropping our entry under a previous
+ *  name. Returns the map so callers can assign it back. */
+function putMcpEntry(
+  servers: Record<string, any> | undefined,
+  c: InstallCtx,
+  entry: Record<string, unknown>
+): Record<string, any> {
+  const next = { ...(servers ?? {}) };
+  const stale = staleMcpName(c);
+  if (stale && isOurMcpEntry(next[stale])) delete next[stale];
+  next[mcpName(c)] = entry;
+  return next;
+}
+
+/** Remove our server from a host's server map, under the current name and any previous one.
+ *  Ownership-checked: a user's own server that happens to share the name is never touched.
+ *  Returns whether anything was removed. */
+function dropMcpEntries(servers: Record<string, any> | undefined, c: InstallCtx): boolean {
+  if (!servers || typeof servers !== "object") return false;
+  let removed = false;
+  for (const name of new Set([mcpName(c), staleMcpName(c)])) {
+    if (name && isOurMcpEntry(servers[name])) {
+      delete servers[name];
+      removed = true;
+    }
+  }
+  return removed;
+}
+
+/** The preflight message for a host that already has a FOREIGN server under our name. */
+function foreignMcpEntryProblem(
+  path: string,
+  c: InstallCtx,
+  existing: unknown
+): string | undefined {
+  if (!existing || isOurMcpEntry(existing)) return undefined;
+  return (
+    `${path} already contains a user-managed MCP server named "${mcpName(c)}". ` +
+    "Rename or remove that entry, or install ours under another name with --mcp-name <name>, " +
+    "then re-run install."
+  );
+}
 
 /** Install/uninstall consume the same lifecycle declaration as the runtime entrypoints. Keeping
  * event names and command files here would allow a host to run a different lifecycle than it installs. */
@@ -537,13 +597,13 @@ const PRIME_CONTEXT_BEGIN = "<!-- hindsight-coding-agents:begin -->";
 const PRIME_CONTEXT_END = "<!-- hindsight-coding-agents:end -->";
 /** What makes the agent reach for memory at all: Prime 0.10 has no hook to inject recall with, and
  *  our MCP server (which also writes the session back) only starts on the first call. */
-const PRIME_CONTEXT = `${PRIME_CONTEXT_BEGIN}
+const primeContext = (serverName: string) => `${PRIME_CONTEXT_BEGIN}
 ## Project memory (Hindsight): required first step
 
 At the start of every task or question in a repository, before you answer or call any other
 tool, run this in Python (\`mcp\` is pre-imported):
 
-    print(await mcp.call_tool("hindsight", "hindsight_reflect", {"query": "<the user's request>"}))
+    print(await mcp.call_tool(${JSON.stringify(serverName)}, "hindsight_reflect", {"query": "<the user's request>"}))
 
 Do it even when the task looks simple or needs no other tools. It answers from past sessions,
 decisions and conventions the code does not show, and it is also what saves this conversation to
@@ -574,7 +634,7 @@ function stripPrimeContext(text: string): string {
  * Prime Agent 0.10+ (the Rust rewrite). It dropped the JS extension host the 0.9 integration used
  * and has no hooks, so this wires the three things it does load (see src/prime-agent.ts):
  *
- * - `settings.json` `mcpServers.hindsight` — our stdio MCP server, which serves the tools and writes
+ * - `settings.json` `mcpServers.<mcpServerName>` — our stdio MCP server, which serves the tools and writes
  *   the session back while it runs. Prime only forwards env vars by reference, so the harness goes
  *   in as `--harness` and the session id / agent dir as references to the kernel's own variables.
  *   The 0.9 `extensions` entry is removed: 0.10 ignores it and 0.9 is no longer supported.
@@ -588,13 +648,7 @@ const primeAgent: HarnessInstaller = {
   detect: (c) => onPath("prime-agent") || existsSync(join(c.home, ".prime", "agent")),
   preflight(c) {
     const path = join(c.home, ".prime", "agent", "settings.json");
-    const existing = readJson(path).mcpServers?.hindsight;
-    if (existing && !isOurMcpEntry(existing)) {
-      return (
-        `${path} already contains a user-managed MCP server named "hindsight". ` +
-        "Rename or remove that entry, then re-run install."
-      );
-    }
+    return foreignMcpEntryProblem(path, c, readJson(path).mcpServers?.[mcpName(c)]);
   },
   install(c) {
     const path = join(c.home, ".prime", "agent", "settings.json");
@@ -603,8 +657,7 @@ const primeAgent: HarnessInstaller = {
       cfg.extensions = cfg.extensions.filter((p: string) => !String(p).includes(MARKER));
       if (!cfg.extensions.length) delete cfg.extensions;
     }
-    cfg.mcpServers = cfg.mcpServers ?? {};
-    cfg.mcpServers.hindsight = {
+    cfg.mcpServers = putMcpEntry(cfg.mcpServers, c, {
       type: "stdio",
       command: "node",
       args: [join(c.dist, "mcp-server.js"), "--harness", "prime-agent"],
@@ -612,7 +665,7 @@ const primeAgent: HarnessInstaller = {
         [PRIME_SESSION_ID_ENV]: { env: "RLM_SESSION_ID" },
         [PRIME_AGENT_DIR_ENV]: { env: "PRIME_AGENT_CODING_AGENT_DIR" },
       },
-    };
+    });
     writeJson(path, cfg);
     c.log?.(`prime-agent: MCP server registered in ${path}`);
     installSkill(c, "prime-agent");
@@ -620,7 +673,7 @@ const primeAgent: HarnessInstaller = {
     const prior = existsSync(ctxFile)
       ? stripPrimeContext(readFileSync(ctxFile, "utf8")).trimEnd()
       : "";
-    writeFileSync(ctxFile, `${prior ? `${prior}\n\n` : ""}${PRIME_CONTEXT}\n`);
+    writeFileSync(ctxFile, `${prior ? `${prior}\n\n` : ""}${primeContext(mcpName(c))}\n`);
     c.log?.(`prime-agent: memory instructions added to ${ctxFile}`);
   },
   uninstall(c) {
@@ -628,9 +681,8 @@ const primeAgent: HarnessInstaller = {
     const path = join(c.home, ".prime", "agent", "settings.json");
     if (existsSync(path)) {
       const cfg = readJson(path);
-      if (isOurMcpEntry(cfg.mcpServers?.hindsight)) {
-        delete cfg.mcpServers.hindsight;
-        if (!Object.keys(cfg.mcpServers).length) delete cfg.mcpServers;
+      if (dropMcpEntries(cfg.mcpServers, c) && !Object.keys(cfg.mcpServers).length) {
+        delete cfg.mcpServers;
       }
       if (Array.isArray(cfg.extensions)) {
         cfg.extensions = cfg.extensions.filter((p: string) => !String(p).includes(MARKER));
@@ -732,14 +784,20 @@ const claudeCode: HarnessInstaller = {
     // Code reported "Failed to connect — Connection closed" with the hindsight_* tools dead.
     // Remove first (a no-op when absent) so the add always lands, matching how every other host
     // wiring is replaced rather than skipped.
-    mcp(["mcp", "remove", "--scope", "user", "hindsight"]);
+    mcp(["mcp", "remove", "--scope", "user", mcpName(c)]);
+    // A rename leaves the old registration behind otherwise. `claude mcp remove` cannot tell ours
+    // from a user's own server, so look at the entry first (user scope lives in ~/.claude.json).
+    const stale = staleMcpName(c);
+    if (stale && isOurMcpEntry(readJson(join(c.home, ".claude.json")).mcpServers?.[stale])) {
+      mcp(["mcp", "remove", "--scope", "user", stale]);
+    }
     if (
       mcp([
         "mcp",
         "add",
         "--scope",
         "user",
-        "hindsight",
+        mcpName(c),
         "--env",
         "HINDSIGHT_MCP_HARNESS=claude-code",
         "--",
@@ -751,7 +809,7 @@ const claudeCode: HarnessInstaller = {
     } else {
       c.log?.(
         `claude-code: could not run \`claude mcp add\` — register the tools manually:\n` +
-          `  claude mcp add --scope user hindsight --env HINDSIGHT_MCP_HARNESS=claude-code -- ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
+          `  claude mcp add --scope user ${mcpName(c)} --env HINDSIGHT_MCP_HARNESS=claude-code -- ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
       );
     }
   },
@@ -766,7 +824,7 @@ const claudeCode: HarnessInstaller = {
       }
     }
     const mcp = c.claudeMcp ?? defaultClaudeMcp;
-    mcp(["mcp", "remove", "--scope", "user", "hindsight"]);
+    mcp(["mcp", "remove", "--scope", "user", mcpName(c)]);
     uninstallSkill(c, "claude-code");
     c.log?.("claude-code: hooks + MCP registration + skill removed");
   },
@@ -782,14 +840,32 @@ function defaultClaudeMcp(args: string[]): boolean {
 }
 
 /**
- * Our `[mcp_servers.hindsight]` table (plus any sub-table of it): the header line through to the
+ * The `[mcp_servers.<name>]` table (plus any sub-table of it): the header line through to the
  * next table header or EOF. Shared by install — which REPLACES the block — and uninstall.
+ * `name` is validated (core/mcp-name.ts) to word characters and `-`, so it needs no escaping.
  */
-const CODEX_MCP_BLOCK_RE = /^\[mcp_servers\.hindsight(?:\.[^\]]+)?\][^\n]*\n(?:(?!\[)[^\n]*\n?)*/gm;
+const codexMcpBlockRe = (name: string) =>
+  new RegExp(`^\\[mcp_servers\\.${name}(?:\\.[^\\]]+)?\\][^\\n]*\\n(?:(?!\\[)[^\\n]*\\n?)*`, "gm");
 
-/** Inline `env`, so CODEX_MCP_BLOCK_RE never has to straddle a `[mcp_servers.hindsight.env]` table. */
-const codexMcpBlock = (dist: string) =>
-  `[mcp_servers.hindsight]\ncommand = ${JSON.stringify(hookNode())}\nargs = [${JSON.stringify(join(dist, "mcp-server.js"))}]\n` +
+/** Our package's server script, as it appears in an emitted `args` line. */
+const OUR_MCP_SCRIPT_RE = /(?:hindsight-)?coding-agents[\\/]+dist[\\/]+mcp-server\.js/;
+
+/** Strip our Codex block under the current name, and under a previous name only when the block
+ *  points at our script — a user's own `[mcp_servers.<old name>]` is not ours to delete. */
+function stripCodexMcpBlocks(toml: string, c: InstallCtx): string {
+  let out = toml.replace(codexMcpBlockRe(mcpName(c)), "");
+  const stale = staleMcpName(c);
+  if (stale) {
+    out = out.replace(codexMcpBlockRe(stale), (block) =>
+      OUR_MCP_SCRIPT_RE.test(block) ? "" : block
+    );
+  }
+  return out;
+}
+
+/** Inline `env`, so the block regex never has to straddle a `[mcp_servers.<name>.env]` table. */
+const codexMcpBlock = (dist: string, name: string) =>
+  `[mcp_servers.${name}]\ncommand = ${JSON.stringify(hookNode())}\nargs = [${JSON.stringify(join(dist, "mcp-server.js"))}]\n` +
   `env = { HINDSIGHT_MCP_HARNESS = "codex" }`;
 
 const codex: HarnessInstaller = {
@@ -809,7 +885,7 @@ const codex: HarnessInstaller = {
     // attributed every Codex write to claude-code could never be repaired by re-running install.
     const tomlPath = join(c.home, ".codex", "config.toml");
     const existing = existsSync(tomlPath) ? readFileSync(tomlPath, "utf8") : "";
-    const toml = existing.replace(CODEX_MCP_BLOCK_RE, "");
+    const toml = stripCodexMcpBlocks(existing, c);
     const additions: string[] = [];
     // Codex ≥ 0.145 deprecates `codex_hooks` for `[features].hooks`; accept either as "already
     // enabled", write the modern name for new installs.
@@ -822,7 +898,7 @@ const codex: HarnessInstaller = {
         additions.push("[features]\nhooks = true");
       }
     }
-    additions.push(codexMcpBlock(c.dist));
+    additions.push(codexMcpBlock(c.dist, mcpName(c)));
     const next = `${toml.replace(/\n*$/, "\n\n")}${additions.join("\n\n")}\n`;
     if (next !== existing) {
       if (existsSync(tomlPath) && !existsSync(`${tomlPath}.hindsight-backup`)) {
@@ -847,7 +923,7 @@ const codex: HarnessInstaller = {
     const tomlPath = join(c.home, ".codex", "config.toml");
     if (existsSync(tomlPath)) {
       const toml = readFileSync(tomlPath, "utf8");
-      const cleaned = toml.replace(CODEX_MCP_BLOCK_RE, "");
+      const cleaned = stripCodexMcpBlocks(toml, c);
       if (cleaned !== toml) writeFileSync(tomlPath, cleaned);
     }
     c.log?.(
@@ -885,10 +961,7 @@ const antigravity: HarnessInstaller = {
     writeJson(hooksPath, hooks);
     const mcpPath = join(c.home, ".gemini", "config", "mcp_config.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = {
-      ...(mcp.mcpServers ?? {}),
-      hindsight: mcpServerEntry(c.dist, "antigravity-cli"),
-    };
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "antigravity-cli"));
     writeJson(mcpPath, mcp);
     const settingsPath = join(c.home, ".gemini", "antigravity-cli", "settings.json");
     const settings = readJson(settingsPath);
@@ -932,10 +1005,7 @@ const antigravity: HarnessInstaller = {
     const mcpPath = join(c.home, ".gemini", "config", "mcp_config.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     const settingsPath = join(c.home, ".gemini", "antigravity-cli", "settings.json");
     if (existsSync(settingsPath)) {
@@ -1251,6 +1321,50 @@ function configureServer(c: InstallCtx, args: string[], installing: readonly str
   return true;
 }
 
+/**
+ * Which name our MCP server is registered under (core/mcp-name.ts): `--mcp-name`, else the
+ * `mcpServerName` an earlier install persisted, else the default. When the flag changes it, the
+ * old name rides along as `previousMcpName` so each host drops our entry under it.
+ * Undefined = an invalid name was asked for; the install aborts before touching anything.
+ */
+function resolveMcpName(
+  c: InstallCtx,
+  args: string[]
+): Pick<InstallCtx, "mcpName" | "previousMcpName"> | undefined {
+  const configured = readJson(hindsightConfigPath(c)).mcpServerName;
+  if (configured !== undefined && !isValidMcpServerName(configured)) {
+    c.log?.(
+      `⚠️  ignoring mcpServerName ${JSON.stringify(configured)} in ${hindsightConfigPath(c)} — ` +
+        `using "${DEFAULT_MCP_SERVER_NAME}"`
+    );
+  }
+  const current = isValidMcpServerName(configured) ? configured : DEFAULT_MCP_SERVER_NAME;
+  const asked = flagValue(args, "mcp-name");
+  if (asked === undefined) return { mcpName: current };
+  if (!isValidMcpServerName(asked)) {
+    c.log?.(
+      `invalid --mcp-name ${JSON.stringify(asked)} — use letters, digits, "-" and "_" ` +
+        `(up to 64, starting with a letter or digit), e.g. --mcp-name hindsight-code`
+    );
+    return undefined;
+  }
+  return { mcpName: asked, previousMcpName: current };
+}
+
+/** Remember an explicit `--mcp-name`, so later installs, uninstalls and the Trae SessionStart
+ *  hook all use it without being told again. The default is stored as the key's ABSENCE. */
+function persistMcpName(c: InstallCtx): void {
+  if (c.previousMcpName === undefined) return; // no --mcp-name on this run: nothing to remember
+  const configPath = hindsightConfigPath(c);
+  const config = readJson(configPath);
+  const name = mcpName(c);
+  if (name === DEFAULT_MCP_SERVER_NAME) delete config.mcpServerName;
+  else config.mcpServerName = name;
+  if (config.mcpServerName === readJson(configPath).mcpServerName) return;
+  writeJson(configPath, config);
+  c.log?.(`mcp: registering the MCP server as "${name}" (mcpServerName in ${configPath})`);
+}
+
 /** Cloud tokens are mandatory: re-ask a couple of times rather than writing a config that 401s
  *  on the first session. Three blank answers mean the user doesn't have one at hand — give up
  *  and let the cloud branch abort with the actionable message. */
@@ -1316,10 +1430,7 @@ const devin: HarnessInstaller = {
     writeJson(configPath, config);
     const mcpPath = join(c.home, ".config", "devin", "mcp_config.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = {
-      ...(mcp.mcpServers ?? {}),
-      hindsight: mcpServerEntry(c.dist, "devin-cli"),
-    };
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "devin-cli"));
     writeJson(mcpPath, mcp);
     c.log?.(`devin-cli: hooks merged into ${configPath}, MCP into ${mcpPath}`);
   },
@@ -1336,10 +1447,7 @@ const devin: HarnessInstaller = {
     const mcpPath = join(c.home, ".config", "devin", "mcp_config.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     c.log?.("devin-cli: hooks + MCP entry removed");
   },
@@ -1361,10 +1469,11 @@ const cursor: HarnessInstaller = {
     writeJson(hooksPath, cfg);
     const mcpPath = join(c.home, ".cursor", "mcp.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = {
-      ...(mcp.mcpServers ?? {}),
-      hindsight: mcpServerEntry(c.dist, "cursor-cli", ["${workspaceFolder}"]),
-    };
+    mcp.mcpServers = putMcpEntry(
+      mcp.mcpServers,
+      c,
+      mcpServerEntry(c.dist, "cursor-cli", ["${workspaceFolder}"])
+    );
     writeJson(mcpPath, mcp);
     c.log?.(`cursor-cli: hooks merged into ${hooksPath}, MCP into ${mcpPath}`);
     installSkill(c, "cursor-cli");
@@ -1382,10 +1491,7 @@ const cursor: HarnessInstaller = {
     const mcpPath = join(c.home, ".cursor", "mcp.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     uninstallSkill(c, "cursor-cli");
     c.log?.("cursor-cli: hooks + MCP entry + skill removed");
@@ -1403,10 +1509,7 @@ const copilot: HarnessInstaller = {
 
     const mcpPath = join(c.home, ".copilot", "mcp-config.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = {
-      ...(mcp.mcpServers ?? {}),
-      hindsight: mcpServerEntry(c.dist, "copilot-cli"),
-    };
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "copilot-cli"));
     writeJson(mcpPath, mcp);
     installSkill(c, "copilot-cli");
     c.log?.(`copilot-cli: hooks installed at ${hooksPath}, MCP into ${mcpPath}`);
@@ -1418,10 +1521,7 @@ const copilot: HarnessInstaller = {
     const mcpPath = join(c.home, ".copilot", "mcp-config.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     uninstallSkill(c, "copilot-cli");
     c.log?.("copilot-cli: hooks + MCP entry + skill removed");
@@ -1487,7 +1587,7 @@ function hasUnmarkedGrokEntries(text: string): boolean {
  * ordering and formatting of a config the user maintains by hand. The caller validates the result
  * with the parser before writing it.
  */
-function stripUnmarkedGrokEntries(toml: string): string {
+function stripUnmarkedGrokEntries(toml: string, serverName: string): string {
   const lines = toml.split("\n");
   // Split into table sections: a header line plus everything up to the next header.
   const sections: { header: string; lines: string[] }[] = [{ header: "", lines: [] }];
@@ -1502,7 +1602,14 @@ function stripUnmarkedGrokEntries(toml: string): string {
     s.lines.slice(1).some((l) => /^\s*[^#\s]/.test(l));
 
   const drop = sections.map((s) => {
-    if (/^\[mcp_servers\.hindsight(\.|\])/.test(s.header)) return true;
+    // Pre-marker releases only ever wrote the default name. Under that name the table would clash
+    // with ours, so it goes; once ours is renamed it only goes when it provably points at us — a
+    // user's own `hindsight` server is exactly what a rename is meant to coexist with.
+    if (/^\[mcp_servers\.hindsight(\.|\])/.test(s.header)) {
+      return (
+        serverName === DEFAULT_MCP_SERVER_NAME || s.lines.some((l) => OUR_MCP_SCRIPT_RE.test(l))
+      );
+    }
     if (/^\[\[hooks\..+\.hooks\]\]$/.test(s.header)) return isOurs(s);
     return false;
   });
@@ -1553,19 +1660,20 @@ const grok: HarnessInstaller = {
     // table, so appending on top of them leaves a file Grok cannot parse — it then reports "No MCP
     // servers configured" and every MCP server, ours included, silently stops working.
     const withoutOurs = hasUnmarkedGrokEntries(stripped)
-      ? stripUnmarkedGrokEntries(stripped)
+      ? stripUnmarkedGrokEntries(stripped, mcpName(c))
       : stripped;
     const tomlString = (value: string) => JSON.stringify(value);
     const block =
       `\n${GROK_MARKER_START}\n` +
-      `[mcp_servers.hindsight]\ncommand = \"node\"\nargs = [${tomlString(join(c.dist, "mcp-server.js"))}]\n` +
+      `[mcp_servers.${mcpName(c)}]\ncommand = \"node\"\nargs = [${tomlString(join(c.dist, "mcp-server.js"))}]\n` +
       `env = { HINDSIGHT_MCP_HARNESS = \"grok-build\" }\n${GROK_MARKER_END}\n`;
     const next = `${withoutOurs.replace(/\n*$/, "\n")}${block}`;
     // Never hand Grok a config it cannot parse: one bad table takes down every MCP server it has.
     if (parseGrokToml(next) === null) {
       c.log?.(
         `grok-build: refusing to write ${path} — the result would not be valid TOML. ` +
-          `Remove the Hindsight hooks and [mcp_servers.hindsight] from it by hand, then re-run install.`
+          `Remove the Hindsight hooks and [mcp_servers.${mcpName(c)}] from it by hand (or pick another ` +
+          `name with --mcp-name), then re-run install.`
       );
       return false;
     }
@@ -1588,7 +1696,7 @@ const grok: HarnessInstaller = {
       const existing = readFileSync(path, "utf8");
       const stripped = existing.replace(GROK_BLOCK_RE, "\n");
       const cleaned = hasUnmarkedGrokEntries(stripped)
-        ? stripUnmarkedGrokEntries(stripped)
+        ? stripUnmarkedGrokEntries(stripped, mcpName(c))
         : stripped;
       // Write when the removal leaves valid TOML — or when the file was already invalid, since
       // dropping our entries cannot make that worse and is usually what repairs it.
@@ -1657,7 +1765,7 @@ const kimi: HarnessInstaller = {
     // Kimi's environment, and silently 401s when it is not.
     const mcpPath = join(kimiHome(c), "mcp.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = { ...(mcp.mcpServers ?? {}), hindsight: mcpServerEntry(c.dist, "kimi-code") };
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "kimi-code"));
     writeJson(mcpPath, mcp);
     installSkill(c, "kimi-code");
     c.log?.(`kimi-code: native hooks installed in ${path}, MCP in ${mcpPath}`);
@@ -1672,10 +1780,7 @@ const kimi: HarnessInstaller = {
     const mcpPath = join(kimiHome(c), "mcp.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     uninstallSkill(c, "kimi-code");
     c.log?.("kimi-code: native hooks + MCP + skill removed");
@@ -1711,10 +1816,7 @@ const cline: HarnessInstaller = {
     ]);
     const mcpPath = join(c.home, ".cline", "data", "settings", "cline_mcp_settings.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = {
-      ...(mcp.mcpServers ?? {}),
-      hindsight: mcpServerEntry(c.dist, "cline-cli"),
-    };
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "cline-cli"));
     writeJson(mcpPath, mcp);
     installSkill(c, "cline-cli");
     c.log?.(
@@ -1731,10 +1833,7 @@ const cline: HarnessInstaller = {
     const mcpPath = join(c.home, ".cline", "data", "settings", "cline_mcp_settings.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (mcp.mcpServers?.hindsight) {
-        delete mcp.mcpServers.hindsight;
-        writeJson(mcpPath, mcp);
-      }
+      if (dropMcpEntries(mcp.mcpServers, c)) writeJson(mcpPath, mcp);
     }
     uninstallSkill(c, "cline-cli");
     c.log?.("cline-cli: native plugin + MCP + skill removed");
@@ -1965,7 +2064,10 @@ const qwen: HarnessInstaller = {
     const mcp = c.qwenMcp ?? defaultQwenMcp;
     // Same rationale as claude-code: `qwen mcp add` refuses a name that already exists, so a
     // re-install could never repoint a stale server. Remove first (a no-op when absent).
-    mcp(["mcp", "remove", "hindsight"]);
+    mcp(["mcp", "remove", mcpName(c)]);
+    // Rename: same ownership check as claude-code, against the user-scope file qwen writes.
+    const stale = staleMcpName(c);
+    if (stale && isOurMcpEntry(settings.mcpServers?.[stale])) mcp(["mcp", "remove", stale]);
     if (
       mcp([
         "mcp",
@@ -1974,7 +2076,7 @@ const qwen: HarnessInstaller = {
         "user",
         "-e",
         "HINDSIGHT_MCP_HARNESS=qwen-code",
-        "hindsight",
+        mcpName(c),
         hookNode(),
         join(c.dist, "mcp-server.js"),
       ])
@@ -1983,7 +2085,7 @@ const qwen: HarnessInstaller = {
     } else {
       c.log?.(
         `qwen-code: could not run \`qwen mcp add\` — register the tools manually:\n` +
-          `  qwen mcp add -s user -e HINDSIGHT_MCP_HARNESS=qwen-code hindsight ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
+          `  qwen mcp add -s user -e HINDSIGHT_MCP_HARNESS=qwen-code ${mcpName(c)} ${hookNodeShell()} "${join(c.dist, "mcp-server.js")}"`
       );
     }
   },
@@ -1998,7 +2100,7 @@ const qwen: HarnessInstaller = {
       }
     }
     const mcp = c.qwenMcp ?? defaultQwenMcp;
-    mcp(["mcp", "remove", "hindsight"]);
+    mcp(["mcp", "remove", mcpName(c)]);
     uninstallSkill(c, "qwen-code");
     c.log?.("qwen-code: hooks + MCP registration + skill removed");
   },
@@ -2021,7 +2123,7 @@ function defaultQwenMcp(args: string[]): boolean {
  *   this file (unlike Claude Code, which nests it under a `hooks` key inside settings.json), so
  *   `mergeHarnessHooks` is applied to the root object, not to a `hooks` property. The matcher-group
  *   entries themselves are Claude-shaped, which is exactly what the "nested" configStyle emits.
- * - `mcp.json` - `mcpServers.hindsight` runs the same stdio `dist/mcp-server.js` as every other
+ * - `mcp.json` - `mcpServers.<mcpServerName>` runs the same stdio `dist/mcp-server.js` as every other
  *   host, tagged with `HINDSIGHT_MCP_HARNESS=factory-droid`. A same-named foreign server blocks
  *   install instead of being overwritten. Droid reloads this file on change.
  * - `skills/` - the companion skill, same copy/uninstall dance as the other hosts.
@@ -2031,13 +2133,7 @@ const factoryDroid: HarnessInstaller = {
   detect: (c) => onPath("droid") || existsSync(join(c.home, ".factory")),
   preflight(c) {
     const mcpPath = join(c.home, ".factory", "mcp.json");
-    const existing = readJson(mcpPath).mcpServers?.hindsight;
-    if (existing && !isOurMcpEntry(existing)) {
-      return (
-        `${mcpPath} already contains a user-managed MCP server named "hindsight". ` +
-        "Rename or remove that entry, then re-run install."
-      );
-    }
+    return foreignMcpEntryProblem(mcpPath, c, readJson(mcpPath).mcpServers?.[mcpName(c)]);
   },
   install(c) {
     const hooksPath = join(c.home, ".factory", "hooks.json");
@@ -2057,8 +2153,7 @@ const factoryDroid: HarnessInstaller = {
 
     const mcpPath = join(c.home, ".factory", "mcp.json");
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = mcp.mcpServers ?? {};
-    mcp.mcpServers.hindsight = mcpServerEntry(c.dist, "factory-droid");
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, "factory-droid"));
     writeJson(mcpPath, mcp);
     c.log?.(`factory-droid: MCP server registered in ${mcpPath}`);
   },
@@ -2073,8 +2168,7 @@ const factoryDroid: HarnessInstaller = {
     const mcpPath = join(c.home, ".factory", "mcp.json");
     if (existsSync(mcpPath)) {
       const mcp = readJson(mcpPath);
-      if (isOurMcpEntry(mcp.mcpServers?.hindsight)) {
-        delete mcp.mcpServers.hindsight;
+      if (dropMcpEntries(mcp.mcpServers, c)) {
         if (Object.keys(mcp.mcpServers).length) writeJson(mcpPath, mcp);
         else rmSync(mcpPath);
       }
@@ -2100,7 +2194,7 @@ const factoryDroid: HarnessInstaller = {
  *
  * MCP and the companion skill land in the same config/home, so ZCode gets the full surface:
  *
- * - `mcp.servers.hindsight` runs the same stdio `dist/mcp-server.js` as every other host, tagged
+ * - `mcp.servers.<mcpServerName>` runs the same stdio `dist/mcp-server.js` as every other host, tagged
  *   `HINDSIGHT_MCP_HARNESS=zcode`. ZCode's schema is `{type, command, args?, cwd?, env?}` and its
  *   loader infers `type: "stdio"` from a `command`, so the shared `mcpServerEntry` drops straight
  *   in. A same-named foreign server blocks install instead of being overwritten.
@@ -2115,13 +2209,7 @@ const zcode: HarnessInstaller = {
   detect: (c) => onPath("zcode") || existsSync(join(c.home, ".zcode")),
   preflight(c) {
     const configPath = zcodeConfigPath(c);
-    const existing = readJson(configPath).mcp?.servers?.hindsight;
-    if (existing && !isOurMcpEntry(existing)) {
-      return (
-        `${configPath} already contains a user-managed MCP server named "hindsight". ` +
-        "Rename or remove that entry, then re-run install."
-      );
-    }
+    return foreignMcpEntryProblem(configPath, c, readJson(configPath).mcp?.servers?.[mcpName(c)]);
   },
   install(c) {
     const configPath = zcodeConfigPath(c);
@@ -2132,8 +2220,7 @@ const zcode: HarnessInstaller = {
     hooks.events = hooks.events ?? {};
     mergeHarnessHooks(hooks.events, "zcode", c.dist);
     config.mcp = config.mcp ?? {};
-    config.mcp.servers = config.mcp.servers ?? {};
-    config.mcp.servers.hindsight = mcpServerEntry(c.dist, "zcode");
+    config.mcp.servers = putMcpEntry(config.mcp.servers, c, mcpServerEntry(c.dist, "zcode"));
     writeJson(configPath, config);
     c.log?.(`zcode: hooks + MCP server merged into ${configPath}`);
     installSkill(c, "zcode");
@@ -2142,8 +2229,7 @@ const zcode: HarnessInstaller = {
     const configPath = zcodeConfigPath(c);
     if (existsSync(configPath)) {
       const config = readJson(configPath);
-      if (isOurMcpEntry(config.mcp?.servers?.hindsight)) {
-        delete config.mcp.servers.hindsight;
+      if (dropMcpEntries(config.mcp?.servers, c)) {
         if (!Object.keys(config.mcp.servers).length) delete config.mcp;
       }
       const hooks = config.hooks;
@@ -2181,8 +2267,7 @@ function removeTraecodeUserMcpEntry(c: InstallCtx): boolean {
     const mcpPath = traecodeMcpPath(c);
     if (!existsSync(mcpPath)) return false;
     const mcp = readJson(mcpPath);
-    if (!isOurMcpEntry(mcp.mcpServers?.hindsight)) return false;
-    delete mcp.mcpServers.hindsight;
+    if (!dropMcpEntries(mcp.mcpServers, c)) return false;
     if (Object.keys(mcp.mcpServers).length) writeJson(mcpPath, mcp);
     else rmSync(mcpPath);
     return true;
@@ -2315,6 +2400,8 @@ const traecode: HarnessInstaller = {
     // writing, a pre-seeded repo turns every later session into a read-only no-op.
     const config = readJson(hindsightConfigPath(c));
     const repos = Object.keys(config.mapPathToBank ?? {}).sort();
+    const staleName = staleMcpName(c);
+    if (staleName) removeWorkspaceMcpEnabledKeys(c.home, staleName);
     if (repos.length) {
       const written: string[] = [];
       const current: string[] = [];
@@ -2326,11 +2413,20 @@ const traecode: HarnessInstaller = {
           skipped.push(repo);
           continue;
         }
-        const outcome = registerTraecodeWorkspaceMcp(repo, { home: c.home, dist: c.dist });
+        // A rename: our entry (and its enable switch) under the old name would keep a second copy
+        // of the tools alive in this repo's windows.
+        const stale = staleMcpName(c);
+        if (stale) removeTraecodeWorkspaceMcpEntry(repo, { home: c.home, serverName: stale });
+        const outcome = registerTraecodeWorkspaceMcp(repo, {
+          home: c.home,
+          dist: c.dist,
+          serverName: mcpName(c),
+        });
         if (outcome === "registered") written.push(repo);
         else if (outcome === "current") current.push(repo);
         else skipped.push(repo);
-        if (ensureWorkspaceMcpEnabled(repo, { home: c.home }) !== "failed") seeded++;
+        if (ensureWorkspaceMcpEnabled(repo, { home: c.home, serverName: mcpName(c) }) !== "failed")
+          seeded++;
       }
       c.log?.(
         `traecode: per-repo MCP registration — ${written.length} written, ${current.length} ` +
@@ -2379,7 +2475,7 @@ const traecode: HarnessInstaller = {
     const config = readJson(hindsightConfigPath(c));
     const repoEntries = Object.keys(config.mapPathToBank ?? {}).sort();
     const cleaned = repoEntries.filter((repo) =>
-      removeTraecodeWorkspaceMcpEntry(repo, { home: c.home })
+      removeTraecodeWorkspaceMcpEntry(repo, { home: c.home, serverName: mcpName(c) })
     );
     if (cleaned.length) {
       c.log?.(`traecode: per-repo MCP registration removed from:\n  ${cleaned.join("\n  ")}`);
@@ -2398,7 +2494,7 @@ const traecode: HarnessInstaller = {
       }
     }
     // The per-workspace enable switches the installer/hook seeded — an uninstall leaves no storage behind.
-    removeWorkspaceMcpEnabledKeys(c.home);
+    removeWorkspaceMcpEnabledKeys(c.home, mcpName(c));
     uninstallSkill(c, "traecode");
     c.log?.(`traecode: hooks + MCP registration + skill removed`);
   },
@@ -2433,8 +2529,7 @@ const genieInstaller = (
     const paths = mcpPaths(c.home);
     const mcpPath = paths.find((p) => existsSync(p)) ?? paths[0];
     const mcp = readJson(mcpPath);
-    mcp.mcpServers = mcp.mcpServers ?? {};
-    mcp.mcpServers.hindsight = mcpServerEntry(c.dist, name);
+    mcp.mcpServers = putMcpEntry(mcp.mcpServers, c, mcpServerEntry(c.dist, name));
     writeJson(mcpPath, mcp);
     c.log?.(`${name}: MCP server registered in ${mcpPath}`);
 
@@ -2453,8 +2548,7 @@ const genieInstaller = (
     for (const mcpPath of mcpPaths(c.home)) {
       if (!existsSync(mcpPath)) continue;
       const mcp = readJson(mcpPath);
-      if (isOurMcpEntry(mcp.mcpServers?.hindsight)) {
-        delete mcp.mcpServers.hindsight;
+      if (dropMcpEntries(mcp.mcpServers, c)) {
         if (!Object.keys(mcp.mcpServers).length) delete mcp.mcpServers;
         writeJson(mcpPath, mcp);
       }
@@ -2570,7 +2664,7 @@ export function run(argv: string[], ctxIn: InstallCtx): number {
   const importHistory = rawArgs.includes("--import-conversations");
   // A flag's VALUE (`--server daemon`) is a bare word too — excluding it keeps "daemon" from being
   // read as a harness name and rejected.
-  const valueArgs = flagValueArgs(rawArgs, ["server", "api-url", "api-token"]);
+  const valueArgs = flagValueArgs(rawArgs, ["server", "api-url", "api-token", "mcp-name"]);
   const names = rawArgs.filter((a) => !a.startsWith("--") && !valueArgs.has(a));
   // Read-only: summarizes the local usage log (core/usage.ts) and touches nothing else.
   if (command === "stats") {
@@ -2606,7 +2700,7 @@ export function run(argv: string[], ctxIn: InstallCtx): number {
         `       hindsight-coding-agents update\n` +
         `       hindsight-coding-agents stats\n` +
         `       [--server cloud|self-hosted|daemon] [--api-url <url>] [--api-token <token>]\n` +
-        `       [--import-conversations] [--enable-workspace-mcp]\n` +
+        `       [--import-conversations] [--enable-workspace-mcp] [--mcp-name <name>]\n` +
         `  all      every agent detected on this machine\n` +
         `  harness  ${INSTALLERS.map((i) => i.name).join(", ")} (agy aliases antigravity-cli)\n` +
         `  update   re-stage the runtime only, leaving every host config untouched\n` +
@@ -2614,6 +2708,9 @@ export function run(argv: string[], ctxIn: InstallCtx): number {
     );
     return command ? 1 : 0;
   }
+  const naming = resolveMcpName(ctx, rawArgs);
+  if (!naming) return 1;
+  ctx = { ...ctx, ...naming };
   let targets: HarnessInstaller[];
   // `all` is spelled out rather than implied by a bare command: this rewrites the config of EVERY
   // detected agent — hooks, MCP registration and the companion skill — which is too much of a
@@ -2671,6 +2768,7 @@ export function run(argv: string[], ctxIn: InstallCtx): number {
     )
   )
     return 1;
+  if (command === "install" && runnable.length > 0) persistMcpName(ctx);
 
   const failed: string[] = [];
   for (const t of runnable) {
